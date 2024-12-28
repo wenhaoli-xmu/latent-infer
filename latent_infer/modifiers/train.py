@@ -8,10 +8,12 @@ from flash_attn import flash_attn_func
 import json
 
 
-def model_forward(self, input_ids, kv_cache):
+def model_forward(self, input_ids, kv_cache, reduce_logits=True):
 
     hidden_states, kv_cache = self.model(input_ids, kv_cache)
-    hidden_states = hidden_states[:, -1:, :]
+
+    if reduce_logits:
+        hidden_states = hidden_states[:, -1:, :]
 
     logits = self.lm_head(hidden_states)
 
@@ -228,7 +230,6 @@ class ModelForTraining(torch.nn.Module):
 
 
     def forward(self, input_ids=None, label=None, kv_cache=None):
-
         hidden_states, logits, kv_cache = self.model(
             input_ids=input_ids, 
             kv_cache=kv_cache)
@@ -239,6 +240,7 @@ class ModelForTraining(torch.nn.Module):
         if label is not None:
             label = torch.tensor(label, dtype=torch.int64, device='cuda')
             loss = torch.nn.functional.cross_entropy(logits.ravel(), label)
+                
 
         return dict(
             kv_cache=kv_cache,

@@ -207,6 +207,23 @@ def sample(args, model, input_ids: list, labels: list, rl_params, lm_params):
 
 
 
+def compute_baseline(args, model, batch):
+    input_ids, labels = batch['input_ids'], batch['labels']
+
+    with torch.no_grad():
+        _, logits, _ = model.model(
+            input_ids=my_slice(input_ids, 0, len(input_ids)),
+            kv_cache=None,
+            reduce_logits=False)
+
+        labels = torch.tensor(labels, dtype=torch.int64, device='cuda')
+        logits = logits.squeeze(0)
+        loss = torch.nn.functional.cross_entropy(logits, labels)
+
+    return loss.item()
+
+
+
 def compute_gradient(args, model, batch, rl_params, lm_params):
     local_rl_grads = []
     local_lm_grads = []
@@ -327,7 +344,8 @@ if __name__ == '__main__':
         lr_adjuster(step=step)
         optimizer.zero_grad()
 
-        # with model.no_sync():
+        baseline = compute_baseline(args, model, batch)
+
         outputs = compute_gradient(args, model, batch, rl_params, lm_params)
 
         copy_gradients(rl_params + lm_params, outputs['grad'])
@@ -337,6 +355,7 @@ if __name__ == '__main__':
         if dist.get_rank() == 0:
             print(
                 f"step-{step:<5d} | "
+                f"baseline-{baseline:>.3f} | "
                 f"loss: {outputs['lm_loss']:>.3f} | "
                 f"ratio: {outputs['ratio']:>.3f}", 
                 flush=True)
