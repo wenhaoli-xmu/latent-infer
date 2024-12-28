@@ -1,17 +1,67 @@
+import torch
 from torch.utils.data import ConcatDataset, DataLoader
 import torch.distributed as dist
 
-import torch
-import numpy as np
-import json
+
+import argparse, random, numpy, os
+from functools import partial
 
 
 from corpus import get_processor, RandomSampleCorpus
-from latent_infer.misc import get_model_and_tokenizer, get_env_conf, get_torch_dtype, get_optimizer_and_lr_adjuster
+from latent_infer.misc import (
+    get_model_and_tokenizer,
+    get_env_conf, 
+    get_torch_dtype, 
+    get_optimizer_and_lr_adjuster)
 
-import argparse, random, numpy, os
-from itertools import chain
-from functools import partial
+
+
+
+def filter_valid(x_list):
+    return list(filter(lambda x: x is not None, x_list))
+
+
+def zero_grad(rl_params, lm_params):
+    for param in rl_params + lm_params:
+        if param.grad is not None:
+            param.grad.data.zero_()
+
+
+def collect_grads(rl_params, lm_params):
+
+    rl_grads = []
+    lm_grads = []
+
+    for param in rl_params:
+        if param.grad is not None:
+            rl_grads.append(param.grad.data.ravel())
+        else:
+            rl_grads.append(torch.zeros_like(param.data).ravel())
+
+    
+    for param in lm_params:
+        if param.grad is not None:
+            lm_grads.append(param.grad.data.ravel())
+        else:
+            lm_grads.append(torch.zeros_like(param.data).ravel())
+
+    return rl_grads, lm_grads
+
+
+
+def enable_fsdp(model):
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+    class_type = type(model._get_layers()[0])
+
+    my_auto_wrap_policy = partial(
+        transformer_auto_wrap_policy, 
+        transformer_layer_cls=set([class_type]))
+
+    return FSDP(
+        module=model, 
+        auto_wrap_policy=my_auto_wrap_policy)
 
 
 def build_dataset(env_conf, tokenizer):
@@ -59,6 +109,7 @@ def backend_setup():
     local_rank = int(os.environ['LOCAL_RANK'])
     world_size = int(os.environ['WORLD_SIZE'])
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
+    torch.cuda.set_device(local_rank)
 
 
 def backend_cleanup():
@@ -74,18 +125,109 @@ def copy_gradients(params, grads):
         start = end
 
 
-def compute_gradient(args, model, batch):
+def my_slice(x, start, end):
+    return torch.tensor(x[start:end], dtype=torch.int64).unsqueeze(0).cuda()
+
+
+def compute_reward(lm_loss, flags, alpha):
+    ratio = sum(flags) / len(flags)
+    reward = -lm_loss - alpha * ratio
+    reward = torch.tensor(reward, dtype=torch.bfloat16, device='cuda')
+
+    return reward
+
+
+def sample(args, model, input_ids: list, labels: list, rl_params, lm_params):
+
+    """
+    假设input-ids和labels是已经错开的了
+    """
+
+    assert isinstance(input_ids, list)
+    assert isinstance(labels, list)
+    assert labels[0] == -100
+
+
+    zero_grad(rl_params, lm_params)
+
+
+    rl_losses, lm_losses, flags = [], [], []
+
+
+    # NOTE: pre-filling phase
+    pos = 0
+    while labels[pos] == -100:
+        pos += 1
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=my_slice(input_ids, 0, pos),
+            label=None,
+            kv_cache=None)
+        outputs['flag'] = None
+
+
+    # NOTE: decoding phase
+    while pos < len(labels):
+        if outputs['flag'] in (None, False):
+            outputs = model(
+                input_ids=my_slice(input_ids, pos, pos + 1),
+                label=labels[pos],
+                kv_cache=outputs['kv_cache'])
+        
+        elif outputs['flag'] is True:
+            outputs = model(
+                input_ids=None,
+                label=None,
+                kv_cache=outputs['kv_cache'])
+
+        lm_losses.append(outputs['loss'])
+        rl_losses.append(outputs['nll'])
+        flags.append(outputs['flag'])
+        pos += 1
+
+
+    # language modeling loss is not always exists
+    lm_losses = filter_valid(lm_losses)
+    
+
+    lm_loss = torch.stack(lm_losses).mean()
+    rl_loss = torch.stack(rl_losses).mean()
+
+    reward = compute_reward(lm_loss.item(), flags, args.alpha)
+
+
+    (lm_loss + rl_loss).backward()
+
+    if dist.get_rank() == 0:
+        import IPython
+        IPython.embed()
+    dist.barrier()
+
+    rl_grads, lm_grads = collect_grads(rl_params, lm_params)
+
+
+    return torch.cat(rl_grads, dim=0), torch.cat(lm_grads), reward
+
+
+
+def compute_gradient(args, model, batch, rl_params, lm_params):
     local_rl_grads = []
     local_lm_grads = []
     local_rewards = []
 
 
-    for _ in range(args.n_samples_per_gpu):
-        print(f"{dist.get_rank}-ok")
+    for _ in range(args.n_samples // dist.get_world_size()):
 
         input_ids, labels = batch['input_ids'], batch['labels']
 
-        rl_grads, lm_grads, rewards = model.sample(input_ids, labels)
+        rl_grads, lm_grads, rewards = sample(
+            args=args, 
+            model=model,
+            input_ids=input_ids, 
+            labels=labels, 
+            rl_params=rl_params, 
+            lm_params=lm_params)
 
         local_rl_grads.append(rl_grads)
         local_lm_grads.append(lm_grads)
@@ -94,7 +236,7 @@ def compute_gradient(args, model, batch):
 
     local_rl_grads = torch.stack(local_rl_grads, dim=0)
     local_lm_grads = torch.stack(local_lm_grads, dim=0)
-    local_rewards = torch.cat(local_rewards)
+    local_rewards = torch.stack(local_rewards)
 
     # local_rl_grads: (n_samples, n_elem)
     # local_lm_grads: (n_samples, n_elem)
@@ -110,6 +252,11 @@ def compute_gradient(args, model, batch):
     dist.all_gather(global_rl_grads, local_rl_grads)
     dist.all_gather(global_lm_grads, local_lm_grads)
     dist.all_gather(global_rewards, local_rewards)
+
+    if dist.get_rank() == 0:
+        import IPython
+        IPython.embed()
+    dist.barrier()
 
     global_rl_grads = torch.cat(global_rl_grads, dim=0)
     global_lm_grads = torch.cat(global_lm_grads, dim=0).mean()
@@ -130,8 +277,9 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env_conf", type=str, required=True)
-    parser.add_argument("--n_samples_per_gpu", type=int, default=32)
+    parser.add_argument("--n_samples", type=int, default=32)
     parser.add_argument("--train_rear_tokens", type=int, default=None)
+    parser.add_argument("--alpha", type=float, default=1.0)
     args = parser.parse_args()
 
     
@@ -147,15 +295,18 @@ if __name__ == '__main__':
     seed_everything(dist.get_rank())
 
 
-    params = model.ft_params()
-    optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
+    rl_params, lm_params = model.rl_params(), model.lm_params()
+    optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(
+        **env_conf['train'], 
+        params=rl_params + lm_params)
 
 
-    model.enable_fsdp()
+    # model = enable_fsdp(model)
+    # torch.cuda.empty_cache()
 
 
     # constraits
-    assert args.n_samples_per_gpu % dist.get_world_size() == 0, f"argument `--n_samples` must be divisible by the number of GPUs"
+    assert args.n_samples % dist.get_world_size() == 0, f"argument `--n_samples` must be divisible by the number of GPUs"
 
 
     # build dataset
@@ -175,10 +326,10 @@ if __name__ == '__main__':
         lr_adjuster(step=step)
         optimizer.zero_grad()
 
-        with model.no_sync():
-            gradient = compute_gradient(args, model, batch)
+        # with model.no_sync():
+        gradient = compute_gradient(args, model, batch, rl_params, lm_params)
 
-        copy_gradients(params, gradient)
+        copy_gradients(rl_params + lm_params, gradient)
         optimizer.step()
 
 

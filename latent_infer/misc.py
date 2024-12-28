@@ -5,6 +5,9 @@ from functools import partial
 import os, math
 
 
+
+
+
 def get_torch_dtype(dtype: str):
     if dtype == 'fp16':
         return torch.float16
@@ -102,6 +105,6 @@ def adjust_lr(optim, step, total, max_lr, min_lr, restart, warmup, plateau):
 
 
 def get_optimizer_and_lr_adjuster(max_lr, train_iters, warmup, weight_decay, beta1, beta2, params, **kwargs):
-    optim = torch.optim.AdamW(params, lr=max_lr, betas=[beta1, beta2], weight_decay=weight_decay)
+    optim = torch.optim.Adadelta(params, lr=max_lr, weight_decay=weight_decay)
     lr_adjuster = partial(adjust_lr, optim=optim, total=train_iters, max_lr=max_lr, min_lr=0, restart=1, warmup=warmup, plateau=0)
     return optim, lr_adjuster

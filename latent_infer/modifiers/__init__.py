@@ -1,4 +1,4 @@
-def get_modifier(method: str, model_type):
+def get_modifier(method: str, model_structure):
 
     if method == 'origin':
         from .origin import Origin
@@ -9,8 +9,9 @@ def get_modifier(method: str, model_type):
         return Greedy
     
     elif method == 'train':
-        from .train import ModelForTraining
-        return ModelForTraining
+        if model_structure == 'qwen2':
+            from .train import ModelForTraining
+            return ModelForTraining
 
     elif method =='eval':
         from .eval import ModelForEvaluation

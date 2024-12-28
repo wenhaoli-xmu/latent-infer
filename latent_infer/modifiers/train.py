@@ -1,36 +1,16 @@
 import torch
 import types
-import torch.distributed
-from transformers.models.llama.modeling_llama import repeat_kv
-from ..modifier import Modifier
-from .utils import check_and_apply_qk_rope
+from transformers.models.qwen2.modeling_qwen2 import repeat_kv
+from .utils import check_and_apply_qk_rope, maybe_zero_3
 from peft import LoraConfig, TaskType, get_peft_model
 
 from flash_attn import flash_attn_func
-import json, logging
-from torch.utils.checkpoint import checkpoint
-from functools import partial
+import json
 
 
-def maybe_zero_3(param, ignore_status=False, name=None):
-    from deepspeed import zero
-    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-    if hasattr(param, "ds_id"):
-        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-            if not ignore_status:
-                logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
-        with zero.GatheredParameters([param]):
-            param = param.data.detach().cpu().clone()
-    else:
-        param = param.detach().cpu().clone()
-    return param
+def model_forward(self, input_ids, kv_cache):
 
-
-
-def model_forward(self, input_ids, input_embeds, kv_cache):
-    assert input_ids is None or input_embeds is None, f"cannot assign `input_ids` and `input_embeds` simutanously"
-
-    hidden_states, kv_cache = self.model(input_ids, input_embeds, kv_cache)
+    hidden_states, kv_cache = self.model(input_ids, kv_cache)
     hidden_states = hidden_states[:, -1:, :]
 
     logits = self.lm_head(hidden_states)
@@ -39,8 +19,10 @@ def model_forward(self, input_ids, input_embeds, kv_cache):
 
 
 
-def model_model_forward(self, input_ids, input_embeds, kv_cache):
-    if input_embeds is None:
+def model_model_forward(self, input_ids, kv_cache):
+    if input_ids is None:
+        input_embeds = self.latent_query
+    else:
         input_embeds = self.embed_tokens(input_ids)
 
     if kv_cache is None:
@@ -125,7 +107,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     return attn_output, kv_cache
 
 
-class ModelForTraining:
+class ModelForTraining(torch.nn.Module):
 
     def _get_conf(self, config):
         if config is not None:
@@ -144,10 +126,12 @@ class ModelForTraining:
 
 
     def __init__(self, model, save_ckp: str, load_ckp: str, config: str):
+
+        super().__init__()
+
         self.save_ckp = save_ckp
         self.load_ckp = load_ckp
         self.model = model
-        self.device = next(iter(model.parameters())).device
 
         self._get_conf(config)
         self._replace_foward_functions()
@@ -166,9 +150,9 @@ class ModelForTraining:
         latent_query = torch.empty(
             size=(1,1,self.model.config.hidden_size), 
             dtype=torch.bfloat16, 
-            device=self.device)
-        self.model.latent_query = torch.nn.Parameter(latent_query, requires_grad=True)
-        torch.nn.init.xavier_uniform_(self.model.latent_query.data)
+            device='cuda')
+        self.model.model.latent_query = torch.nn.Parameter(latent_query, requires_grad=True)
+        torch.nn.init.xavier_uniform_(self.model.model.latent_query.data)
 
 
         # build reinforcement learning head
@@ -176,9 +160,9 @@ class ModelForTraining:
             in_features=self.model.lm_head.in_features, 
             out_features=1,
             dtype=torch.bfloat16,
-            device=self.device)
+            device='cuda')
         torch.nn.init.xavier_uniform_(self.model.flag_head.weight)
-        torch.nn.init.constant_(self.model.flag_head.bias, val=-1.0)
+        torch.nn.init.constant_(self.model.flag_head.bias, val=0)
 
 
         for layer in self.model.model.layers:
@@ -205,12 +189,12 @@ class ModelForTraining:
         return self.model.model.layers
     
 
-    def _rl_params(self):
+    def rl_params(self):
         return list(self.model.flag_head.parameters())
 
 
-    def _lm_params(self):
-        params = [self.model.latent_query]
+    def lm_params(self):
+        params = [self.model.model.latent_query]
 
         if self.conf['lora']['enable'] is True:
             for layer in self._get_layers():
@@ -221,12 +205,6 @@ class ModelForTraining:
                     layer.self_attn.k_proj.lora_B.default.weight]
 
         return params
-    
-
-    def _zero_grad(self):
-        for param in self.ft_params():
-            if param.grad is not None:
-                param.grad.data.zero_()
 
 
     def _compute_nll_and_flag(self, hidden_states):
@@ -235,30 +213,8 @@ class ModelForTraining:
         probs = logits.detach().sigmoid()
         flag = (probs > torch.rand(1, dtype=probs.dtype, device=probs.device)).item()
         return nll if flag else logits + nll, flag
-    
 
-    def _greedy_decode(self, logits):
-        return logits.argmax(dim=-1).reshape(1,1)
     
-
-    def _is_eos_token(self, next_token, eos_token_id):
-        return next_token.ravel().item() in eos_token_id
-    
-
-    def _split_input_ids(self, input_ids):
-        return input_ids[:, -1:], input_ids[:, :-1]
-    
-
-    def _slice(self, x, start, end):
-        return torch.tensor(x[start:end], dtype=torch.int64).unsqueeze(0).to(self.device)
-    
-
-    def _compute_lm_loss(self, logits, label):
-        label = torch.tensor(label, dtype=torch.int64, device=self.device)
-        lm_loss = torch.nn.functional.cross_entropy(logits.ravel(), label)
-        return lm_loss.unsqueeze(0)
-    
-
     def load_checkpoint(self, ckp: str = None):
         ckp = ckp if ckp is not None else self.load_ckp
         checkpoint = torch.load(ckp, map_location="cpu")
@@ -271,147 +227,25 @@ class ModelForTraining:
         torch.save([maybe_zero_3(param) for param in self.ft_params()], ckp)
 
 
-    def enable_fsdp(self):
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    def forward(self, input_ids=None, label=None, kv_cache=None):
 
-        class_type = type(self._get_layers()[0])
-
-        my_auto_wrap_policy = partial(
-            transformer_auto_wrap_policy, 
-            transformer_layer_cls=set([class_type]))
-
-        self.model = FSDP(
-            module=self.model, 
-            auto_wrap_policy=my_auto_wrap_policy)
+        hidden_states, logits, kv_cache = self.model(
+            input_ids=input_ids, 
+            kv_cache=kv_cache)
         
-        torch.cuda.empty_cache()
-        
+        nll, flag = self._compute_nll_and_flag(hidden_states)
 
-    def no_sync(self):
-        return self.model.no_sync()
-        
+        loss = None
+        if label is not None:
+            label = torch.tensor(label, dtype=torch.int64, device='cuda')
+            loss = torch.nn.functional.cross_entropy(logits.ravel(), label)
+
+        return dict(
+            kv_cache=kv_cache,
+            loss=loss,
+            nll=nll,
+            flag=flag)
 
 
     def ft_params(self):
-        params = list(self.model.flag_head.parameters())
-        params.append(self.model.latent_query)
-
-        if self.conf['lora']['enable'] is True:
-            for layer in self._get_layers():
-                params += [
-                    layer.self_attn.q_proj.lora_A.default.weight,
-                    layer.self_attn.q_proj.lora_B.default.weight,
-                    layer.self_attn.k_proj.lora_A.default.weight,
-                    layer.self_attn.k_proj.lora_B.default.weight]
-
-        return params
-
-
-    def sample(self, input_ids: list, labels: list):
-
-        """
-        假设input-ids和labels是已经错开的了
-        """
-
-        assert isinstance(input_ids, list)
-        assert isinstance(labels, list)
-        assert labels[0] == -100
-
-
-        self._zero_grad()
-        self.device = next(iter(self.model.parameters())).device
-
-        start = 0
-        kv_cache = None
-        rl_losses, lm_losses = [], []
-        flags = []
-
-
-        while start < len(input_ids):
-            if labels[start] == -100:
-                # parallel computation without gradient
-                end = start + 1
-                while labels[end] == -100:
-                    end += 1
-
-                with torch.no_grad():
-                    # no need to compute gradient in pre-filling phase
-                    _, _, kv_cache = self.model(
-                        input_ids=self._slice(input_ids, start, end - 1),
-                        input_embeds=None,
-                        kv_cache=kv_cache)
-                
-                hidden_states, logits, kv_cache = self.model(
-                    input_ids=self._slice(input_ids, end - 1, end),
-                    input_embeds=None,
-                    kv_cache=kv_cache)
-                
-                start = end
-
-            else:
-                # decoding phase
-                if flag is True:
-                    rl_losses.append(nll)
-
-                    hidden_states, logits, kv_cache = self.model(
-                        input_ids=None,
-                        input_embeds=self.model.latent_query,
-                        kv_cache=kv_cache)
-                else:
-                    lm_loss = self._compute_lm_loss(logits, labels[start])
-                    lm_losses.append(lm_loss)
-
-                    hidden_states, logits, kv_cache = self.model(
-                        input_ids=self._slice(input_ids, start, start + 1),
-                        input_embeds=None,
-                        kv_cache=kv_cache)
-                
-                    start += 1
-                    
-            nll, flag = self._compute_nll_and_flag(hidden_states)
-            flags.append(flag)
-
-
-        ratio = sum(flags) / len(flags)
-
-
-        rl_loss = torch.cat(rl_losses).mean() if len(rl_losses) > 1 else rl_losses[0].mean()
-        lm_loss = torch.cat(lm_losses).mean() if len(lm_losses) > 1 else lm_losses[0].mean()
-            
-
-        (rl_loss + lm_loss).backward()
-
-
-        reward = lm_loss.item() + self.conf['reward']['alpha'] * ratio
-        reward = torch.tensor(reward, dtype=torch.bfloat16, device=self.device)
-
-        # 收集
-        # 1. rl的gradient
-        # 2. lm的gradient
-        # 3. latent output占比
-
-        rl_grads = []
-        lm_grads = []
-
-        for param in self._rl_params():
-            cond = param.grad is not None
-            cond = cond and param.grad.data.count_nonzero().sum() > 0
-            
-            if cond:
-                rl_grads.append(param.grad.data.ravel())
-            else:
-                rl_grads.append(torch.zeros_like(param.data).ravel())
-
-        
-        for param in self._lm_params():
-            cond = param.grad is not None
-            cond = cond and param.grad.data.count_nonzero().sum() > 0
-
-            if cond:
-                lm_grads.append(param.grad.data.ravel())
-            else:
-                lm_grads.append(torch.zeros_like(param.data).ravel())
-
-
-        return torch.cat(rl_grads, dim=0), torch.cat(lm_grads), reward
+        return self._rl_params() + self._lm_params()

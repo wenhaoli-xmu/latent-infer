@@ -4,8 +4,5 @@
         "r": 16,
         "alpha": 32,
         "dropout": 0.0
-    },
-    "reward": {
-        "alpha": 1.0
     }
 }

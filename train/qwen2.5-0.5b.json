@@ -1,9 +1,9 @@
 {
     "model": {
-        "model_name": "meta-llama/Llama-2-7b-hf",
+        "model_name": "unsloth/Qwen2.5-0.5B",
         "model_dtype": "bf16",
         "model_method": "train",
-        "model_structure": null,
+        "model_structure": "qwen2",
         "save_ckp": "ckp/model.pth",
         "load_ckp": null,
         "config": "config/train.json",
