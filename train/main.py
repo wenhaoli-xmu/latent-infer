@@ -2,10 +2,8 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader
 import torch.distributed as dist
 
-
 import argparse, random, numpy, os
 from functools import partial
-
 
 from corpus import get_processor, RandomSampleCorpus
 from latent_infer.misc import (
@@ -13,8 +11,6 @@ from latent_infer.misc import (
     get_env_conf, 
     get_torch_dtype, 
     get_optimizer_and_lr_adjuster)
-
-
 
 
 def filter_valid(x_list):
@@ -112,6 +108,7 @@ def backend_setup():
     torch.cuda.set_device(local_rank)
 
 
+
 def backend_cleanup():
     dist.destroy_process_group()
 
@@ -129,11 +126,9 @@ def my_slice(x, start, end):
     return torch.tensor(x[start:end], dtype=torch.int64).unsqueeze(0).cuda()
 
 
-def compute_reward(lm_loss, flags, alpha):
-    ratio = sum(flags) / len(flags)
+def compute_reward(lm_loss, ratio, alpha):
     reward = -lm_loss - alpha * ratio
     reward = torch.tensor(reward, dtype=torch.bfloat16, device='cuda')
-
     return reward
 
 
@@ -187,27 +182,28 @@ def sample(args, model, input_ids: list, labels: list, rl_params, lm_params):
         pos += 1
 
 
-    # language modeling loss is not always exists
+    # backward
     lm_losses = filter_valid(lm_losses)
-    
-
     lm_loss = torch.stack(lm_losses).mean()
     rl_loss = torch.stack(rl_losses).mean()
-
-    reward = compute_reward(lm_loss.item(), flags, args.alpha)
-
-
     (lm_loss + rl_loss).backward()
 
-    if dist.get_rank() == 0:
-        import IPython
-        IPython.embed()
-    dist.barrier()
 
+    # ratio & reward
+    ratio = sum(flags) / len(flags)
+    reward = compute_reward(lm_loss.item(), ratio, args.alpha)
+
+
+    # collect gradients
     rl_grads, lm_grads = collect_grads(rl_params, lm_params)
 
 
-    return torch.cat(rl_grads, dim=0), torch.cat(lm_grads), reward
+    return dict(
+        rl_grads=torch.cat(rl_grads, dim=0),
+        lm_grads=torch.cat(lm_grads),
+        reward=reward,
+        ratio=ratio,
+        lm_loss=lm_loss.item())
 
 
 
@@ -215,13 +211,15 @@ def compute_gradient(args, model, batch, rl_params, lm_params):
     local_rl_grads = []
     local_lm_grads = []
     local_rewards = []
+    local_ratios = []
+    local_lm_losses = []
 
 
     for _ in range(args.n_samples // dist.get_world_size()):
 
         input_ids, labels = batch['input_ids'], batch['labels']
 
-        rl_grads, lm_grads, rewards = sample(
+        outputs = sample(
             args=args, 
             model=model,
             input_ids=input_ids, 
@@ -229,18 +227,18 @@ def compute_gradient(args, model, batch, rl_params, lm_params):
             rl_params=rl_params, 
             lm_params=lm_params)
 
-        local_rl_grads.append(rl_grads)
-        local_lm_grads.append(lm_grads)
-        local_rewards.append(rewards)
+        local_rl_grads.append(outputs['rl_grads'])
+        local_lm_grads.append(outputs['lm_grads'])
+        local_rewards.append(outputs['reward'])
+        local_ratios.append(outputs['ratio'])
+        local_lm_losses.append(outputs['lm_loss'])
 
 
     local_rl_grads = torch.stack(local_rl_grads, dim=0)
     local_lm_grads = torch.stack(local_lm_grads, dim=0)
     local_rewards = torch.stack(local_rewards)
-
-    # local_rl_grads: (n_samples, n_elem)
-    # local_lm_grads: (n_samples, n_elem)
-    # local_rewards: (n_samples)
+    local_ratio_avg = torch.tensor(sum(local_ratios) / len(local_ratios), device='cuda')
+    local_lm_loss_avg = torch.tensor(sum(local_lm_losses) / len(local_lm_losses), device='cuda')
 
     assert local_rl_grads.ndim == 2 and local_lm_grads.ndim == 2 and local_rewards.ndim == 1
     assert local_rl_grads.shape[0] == local_lm_grads.shape[0] == local_rewards.shape[0]
@@ -248,24 +246,28 @@ def compute_gradient(args, model, batch, rl_params, lm_params):
     global_rl_grads = [torch.empty_like(local_rl_grads) for _ in range(dist.get_world_size())]
     global_lm_grads = [torch.empty_like(local_lm_grads) for _ in range(dist.get_world_size())]
     global_rewards = [torch.empty_like(local_rewards) for _ in range(dist.get_world_size())]
+    global_ratio_avg = [torch.empty_like(local_ratio_avg) for _ in range(dist.get_world_size())]
+    global_lm_loss_avg = [torch.empty_like(local_lm_loss_avg) for _ in range(dist.get_world_size())]
 
     dist.all_gather(global_rl_grads, local_rl_grads)
     dist.all_gather(global_lm_grads, local_lm_grads)
     dist.all_gather(global_rewards, local_rewards)
-
-    if dist.get_rank() == 0:
-        import IPython
-        IPython.embed()
-    dist.barrier()
+    dist.all_gather(global_ratio_avg, local_ratio_avg)
+    dist.all_gather(global_lm_loss_avg, local_lm_loss_avg)
 
     global_rl_grads = torch.cat(global_rl_grads, dim=0)
-    global_lm_grads = torch.cat(global_lm_grads, dim=0).mean()
+    global_lm_grads = torch.cat(global_lm_grads, dim=0).mean(0)
     global_rewards = torch.cat(global_rewards).unsqueeze(-1)
+    global_ratio_avg = (sum(global_ratio_avg) / len(global_ratio_avg)).item()
+    global_lm_loss_avg = (sum(global_lm_loss_avg) / len(global_lm_loss_avg)).item()
 
     global_rewards = (global_rewards - global_rewards.mean()) / global_rewards.std()
     global_rl_grads = (global_rl_grads * global_rewards).mean(0)
 
-    return torch.cat([global_rl_grads, global_lm_grads])
+    return dict(
+        grad=torch.cat([global_rl_grads, global_lm_grads]),
+        ratio=global_ratio_avg,
+        lm_loss=global_lm_loss_avg)
 
 
 
@@ -282,7 +284,6 @@ if __name__ == '__main__':
     parser.add_argument("--alpha", type=float, default=1.0)
     args = parser.parse_args()
 
-    
 
     env_conf = get_env_conf(args.env_conf)
     env_conf['model']['device_map'] = {"": dist.get_rank()}
@@ -327,19 +328,18 @@ if __name__ == '__main__':
         optimizer.zero_grad()
 
         # with model.no_sync():
-        gradient = compute_gradient(args, model, batch, rl_params, lm_params)
+        outputs = compute_gradient(args, model, batch, rl_params, lm_params)
 
-        copy_gradients(rl_params + lm_params, gradient)
+        copy_gradients(rl_params + lm_params, outputs['grad'])
         optimizer.step()
 
 
-        # if step % 100 == 0 and dist.get_rank() == 0:
-        #     print(
-        #         f"step-{step:<5d} | "
-        #         f"loss_baseline: {loss_baseline.item():>.3f} | "
-        #         f"loss: {np.mean(losses):>.3f} | "
-        #         f"ratio: {np.mean(ratios):>.3f}", 
-        #         flush=True)
+        if dist.get_rank() == 0:
+            print(
+                f"step-{step:<5d} | "
+                f"loss: {outputs['lm_loss']:>.3f} | "
+                f"ratio: {outputs['ratio']:>.3f}", 
+                flush=True)
 
 
     if dist.get_rank() == 0:

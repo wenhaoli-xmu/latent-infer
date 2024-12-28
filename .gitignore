@@ -7,4 +7,5 @@ data_cache
 data
 
 # misc
+wandb
 *.egg-info

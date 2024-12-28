@@ -162,7 +162,7 @@ class ModelForTraining(torch.nn.Module):
             dtype=torch.bfloat16,
             device='cuda')
         torch.nn.init.xavier_uniform_(self.model.flag_head.weight)
-        torch.nn.init.constant_(self.model.flag_head.bias, val=0)
+        torch.nn.init.constant_(self.model.flag_head.bias, val=-1.0)
 
 
         for layer in self.model.model.layers:
