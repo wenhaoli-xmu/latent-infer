@@ -92,19 +92,29 @@ def lr_scheduler(epoch, total_epochs, warmup, plateau, max_lr, min_lr, restart=2
     return lr
 
 
-def adjust_lr(optim, step, total, max_lr, min_lr, restart, warmup, plateau):
+def adjust_lr(optim, step, total, min_lr, restart, warmup, plateau):
     for param_group in optim.param_groups:
+        group_max_lr = param_group.get('max_lr')  # 支持每个组不同的 max_lr
         param_group['lr'] = lr_scheduler(
-            step, 
-            total, 
-            warmup=warmup, 
-            plateau=plateau, 
-            max_lr=max_lr, 
-            min_lr=min_lr, 
-            restart=restart)
+            step,
+            total,
+            warmup=warmup,
+            plateau=plateau,
+            max_lr=group_max_lr,
+            min_lr=min_lr,
+            restart=restart
+        )
 
+def get_optimizer_and_lr_adjuster(max_lr_rl, max_lr_lm, train_iters, warmup, weight_decay, beta1, beta2, rl_params, lm_params, **kwargs):
+    optim = torch.optim.AdamW(
+        [
+            {'params': rl_params, 'lr': max_lr_rl, 'max_lr': max_lr_rl},  
+            {'params': lm_params, 'lr': max_lr_lm, 'max_lr': max_lr_lm}
+        ],
+        betas=[beta1, beta2],
+        weight_decay=weight_decay
+    )
 
-def get_optimizer_and_lr_adjuster(max_lr, train_iters, warmup, weight_decay, beta1, beta2, params, **kwargs):
-    optim = torch.optim.Adadelta(params, lr=max_lr, weight_decay=weight_decay)
-    lr_adjuster = partial(adjust_lr, optim=optim, total=train_iters, max_lr=max_lr, min_lr=0, restart=1, warmup=warmup, plateau=0)
+    lr_adjuster = partial(adjust_lr, optim=optim, total=train_iters, min_lr=0, restart=1, warmup=warmup, plateau=0)
+
     return optim, lr_adjuster

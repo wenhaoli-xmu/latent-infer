@@ -118,7 +118,7 @@ def copy_gradients(params, grads):
     start, end = 0, 0
     for param in params:
         end = param.numel() + start
-        param.grad.data.copy_(grads[start:end].reshape_as(param.grad.data))
+        param.grad.set_(grads[start:end].reshape_as(param.data))
         start = end
 
 
@@ -282,7 +282,8 @@ def compute_gradient(args, model, batch, rl_params, lm_params):
     global_rl_grads = (global_rl_grads * global_rewards).mean(0)
 
     return dict(
-        grad=torch.cat([global_rl_grads, global_lm_grads]),
+        rl_grads=global_rl_grads,
+        lm_grads=global_lm_grads,
         ratio=global_ratio_avg,
         lm_loss=global_lm_loss_avg)
 
@@ -316,7 +317,8 @@ if __name__ == '__main__':
     rl_params, lm_params = model.rl_params(), model.lm_params()
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(
         **env_conf['train'], 
-        params=rl_params + lm_params)
+        rl_params=rl_params,
+        lm_params=lm_params)
 
 
     # model = enable_fsdp(model)
@@ -348,7 +350,8 @@ if __name__ == '__main__':
 
         outputs = compute_gradient(args, model, batch, rl_params, lm_params)
 
-        copy_gradients(rl_params + lm_params, outputs['grad'])
+        copy_gradients(rl_params, outputs['rl_grads'])
+        copy_gradients(lm_params, outputs['lm_grads'])
         optimizer.step()
 
 
