@@ -118,7 +118,7 @@ def copy_gradients(params, grads):
     start, end = 0, 0
     for param in params:
         end = param.numel() + start
-        param.grad.set_(grads[start:end].reshape_as(param.data))
+        param.grad = grads[start:end].reshape_as(param.data)
         start = end
 
 
