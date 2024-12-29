@@ -13,7 +13,7 @@
     "train": {
         "train_iters": 1000,
         "max_lr_rl": 0.001,
-        "max_lr_lm": 5e-5,
+        "max_lr_lm": 0.001,
         "warmup": 0.01,
         "beta1": 0.9,
         "beta2": 0.95,

@@ -1,6 +1,6 @@
 {
     "lora": {
-        "enable": false,
+        "enable": true,
         "r": 16,
         "alpha": 32,
         "dropout": 0.0

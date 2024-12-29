@@ -8,7 +8,7 @@ from flash_attn import flash_attn_func
 import json
 
 
-def model_forward(self, input_ids, kv_cache, reduce_logits=True):
+def model_forward(self, input_ids, kv_cache, reduce_logits=True, **kwargs):
 
     hidden_states, kv_cache = self.model(input_ids, kv_cache)
 
@@ -138,9 +138,7 @@ class ModelForTraining(torch.nn.Module):
         self._get_conf(config)
         self._replace_foward_functions()
         self._maybe_enable_lora()
-
         self.model.train()
-
 
 
     def _replace_foward_functions(self):
@@ -187,24 +185,31 @@ class ModelForTraining(torch.nn.Module):
 
     def _get_layers(self):
         if self.conf['lora']['enable'] is True:
-            return self.model.base_model.model.layers
+            return self.model.model.model.layers
         return self.model.model.layers
     
 
     def rl_params(self):
-        return list(self.model.flag_head.parameters())
+        if self.conf['lora']['enable'] is True:
+            return list(self.model.base_model.flag_head.parameters())
+        else:
+            return list(self.model.flag_head.parameters())
 
 
     def lm_params(self):
-        params = [self.model.model.latent_query]
+        if self.conf['lora']['enable'] is True:
+            params = [self.model.model.model.latent_query]
+        else:
+            params = [self.model.model.latent_query]
 
         if self.conf['lora']['enable'] is True:
             for layer in self._get_layers():
+
                 params += [
                     layer.self_attn.q_proj.lora_A.default.weight,
                     layer.self_attn.q_proj.lora_B.default.weight,
-                    layer.self_attn.k_proj.lora_A.default.weight,
-                    layer.self_attn.k_proj.lora_B.default.weight]
+                    layer.self_attn.v_proj.lora_A.default.weight,
+                    layer.self_attn.v_proj.lora_B.default.weight]
 
         return params
 
@@ -229,7 +234,7 @@ class ModelForTraining(torch.nn.Module):
         torch.save([maybe_zero_3(param) for param in self.ft_params()], ckp)
 
 
-    def forward(self, input_ids=None, label=None, kv_cache=None):
+    def forward(self, input_ids=None, label=None, kv_cache=None, **kwargs):
         hidden_states, logits, kv_cache = self.model(
             input_ids=input_ids, 
             kv_cache=kv_cache)

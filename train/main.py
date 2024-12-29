@@ -118,7 +118,7 @@ def copy_gradients(params, grads):
     start, end = 0, 0
     for param in params:
         end = param.numel() + start
-        param.grad.set_(grads[start:end].reshape_as(param.data))
+        param.grad = grads[start:end].reshape_as(param.data)
         start = end
 
 
@@ -355,12 +355,23 @@ if __name__ == '__main__':
         optimizer.step()
 
 
+        rl_mag = 0
+        for param in rl_params:
+            rl_mag += param.data.abs().mean().item()
+
+        lm_mag = 0
+        for param in lm_params:
+            lm_mag += param.data.abs().mean().item()
+
+
         if dist.get_rank() == 0:
             print(
                 f"step-{step:<5d} | "
                 f"baseline-{baseline:>.3f} | "
                 f"loss: {outputs['lm_loss']:>.3f} | "
-                f"ratio: {outputs['ratio']:>.3f}", 
+                f"ratio: {outputs['ratio']:>.3f} | "
+                f"mag-rl: {rl_mag} | "
+                f"mag-lm: {lm_mag}" ,
                 flush=True)
 
 

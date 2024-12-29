@@ -1,7 +1,7 @@
 torchrun \
     --nnodes 1 \
-    --nproc_per_node 4 \
+    --nproc_per_node 8 \
     train/main.py \
     --env_conf train/qwen2.5-0.5b.json \
     --n_samples 16 \
-    --train_rear_tokens 32
+    --train_rear_tokens 16
