@@ -1,4 +1,5 @@
 import torch
+import torch.utils
 from torch.utils.data import ConcatDataset, DataLoader
 import torch.distributed as dist
 
@@ -11,6 +12,9 @@ from latent_infer.misc import (
     get_env_conf, 
     get_torch_dtype, 
     get_optimizer_and_lr_adjuster)
+
+
+from pygments.console import colorize
 
 
 def filter_valid(x_list):
@@ -34,7 +38,6 @@ def collect_grads(rl_params, lm_params):
         else:
             rl_grads.append(torch.zeros_like(param.data).ravel())
 
-    
     for param in lm_params:
         if param.grad is not None:
             lm_grads.append(param.grad.data.ravel())
@@ -113,12 +116,15 @@ def backend_cleanup():
     dist.destroy_process_group()
 
 
-def copy_gradients(params, grads):
+def clip_and_copy_gradients(params, grads):
     # copy gradients
     start, end = 0, 0
     for param in params:
         end = param.numel() + start
         param.grad = grads[start:end].reshape_as(param.data)
+        if param.grad.isnan().count_nonzero() > 0:
+            print(colorize("red", "warning: ") + "gradient overflow", flush=True)
+            param.grad.data.zero_()
         start = end
 
 
@@ -158,7 +164,9 @@ def sample(args, model, input_ids: list, labels: list, rl_params, lm_params):
         outputs = model(
             input_ids=my_slice(input_ids, 0, pos),
             label=None,
-            kv_cache=None)
+            kv_cache=None,
+            pos=-1,
+            fix_prob=args.fix_prob) # pos = -1 indicate automatic position embedding
         outputs['flag'] = None
 
 
@@ -168,19 +176,22 @@ def sample(args, model, input_ids: list, labels: list, rl_params, lm_params):
             outputs = model(
                 input_ids=my_slice(input_ids, pos, pos + 1),
                 label=labels[pos],
-                kv_cache=outputs['kv_cache'])
+                kv_cache=outputs['kv_cache'],
+                pos=pos,
+                fix_prob=args.fix_prob)
+            pos += 1
         
         elif outputs['flag'] is True:
             outputs = model(
                 input_ids=None,
                 label=None,
-                kv_cache=outputs['kv_cache'])
-
+                kv_cache=outputs['kv_cache'],
+                pos=None,
+                fix_prob=args.fix_prob)
+            
         lm_losses.append(outputs['loss'])
         rl_losses.append(outputs['nll'])
         flags.append(outputs['flag'])
-        pos += 1
-
 
     # backward
     lm_losses = filter_valid(lm_losses)
@@ -207,13 +218,14 @@ def sample(args, model, input_ids: list, labels: list, rl_params, lm_params):
 
 
 
-def compute_baseline(args, model, batch):
+def compute_baseline(model, batch):
     input_ids, labels = batch['input_ids'], batch['labels']
 
     with torch.no_grad():
         _, logits, _ = model.model(
             input_ids=my_slice(input_ids, 0, len(input_ids)),
             kv_cache=None,
+            pos=-1, # automatic
             reduce_logits=False)
 
         labels = torch.tensor(labels, dtype=torch.int64, device='cuda')
@@ -288,6 +300,35 @@ def compute_gradient(args, model, batch, rl_params, lm_params):
         lm_loss=global_lm_loss_avg)
 
 
+def print_info(step, baseline, outputs, rl_params, lm_params):
+    rl_mag = 0
+    for param in rl_params:
+        rl_mag += param.data.abs().mean().item()
+
+    lm_mag = 0
+    for param in lm_params:
+        lm_mag += param.data.abs().mean().item()
+
+
+    if dist.get_rank() == 0:
+        if abs(baseline - outputs['lm_loss']) < 0.04:
+            color = "yellow"
+        elif baseline > outputs['lm_loss']:
+            color = "green"
+        else:
+            color = "red"
+
+        loss_info = "loss: " + colorize(color, f"{outputs['lm_loss']:>.3f}")
+        print(
+            f"step-{step:<5d} | "
+            f"baseline: {baseline:>.3f} | "
+            f"{loss_info} | "
+            f"ratio: {outputs['ratio']:>.3f} | "
+            f"mag-rl: {rl_mag} | "
+            f"mag-lm: {lm_mag}" ,
+            flush=True)
+
+
 
 if __name__ == '__main__':
 
@@ -297,9 +338,10 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env_conf", type=str, required=True)
-    parser.add_argument("--n_samples", type=int, default=32)
+    parser.add_argument("--n_samples", type=int, default=16)
     parser.add_argument("--train_rear_tokens", type=int, default=None)
-    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--alpha", type=float, default=0.1)
+    parser.add_argument("--fix_prob", type=float, default=None)
     args = parser.parse_args()
 
 
@@ -311,6 +353,7 @@ if __name__ == '__main__':
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
+    model.init_latent_query(tokenizer.eos_token_id)
     seed_everything(dist.get_rank())
 
 
@@ -346,33 +389,21 @@ if __name__ == '__main__':
         lr_adjuster(step=step)
         optimizer.zero_grad()
 
-        baseline = compute_baseline(args, model, batch)
+
+        baseline = compute_baseline(model, batch)
+
 
         outputs = compute_gradient(args, model, batch, rl_params, lm_params)
 
-        copy_gradients(rl_params, outputs['rl_grads'])
-        copy_gradients(lm_params, outputs['lm_grads'])
+
+        clip_and_copy_gradients(rl_params, outputs['rl_grads'])
+        clip_and_copy_gradients(lm_params, outputs['lm_grads'])
+
+
         optimizer.step()
 
 
-        rl_mag = 0
-        for param in rl_params:
-            rl_mag += param.data.abs().mean().item()
-
-        lm_mag = 0
-        for param in lm_params:
-            lm_mag += param.data.abs().mean().item()
-
-
-        if dist.get_rank() == 0:
-            print(
-                f"step-{step:<5d} | "
-                f"baseline-{baseline:>.3f} | "
-                f"loss: {outputs['lm_loss']:>.3f} | "
-                f"ratio: {outputs['ratio']:>.3f} | "
-                f"mag-rl: {rl_mag} | "
-                f"mag-lm: {lm_mag}" ,
-                flush=True)
+        print_info(step, baseline, outputs, rl_params, lm_params)
 
 
     if dist.get_rank() == 0:

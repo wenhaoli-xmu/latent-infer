@@ -8,10 +8,13 @@ def get_modifier(method: str, model_structure):
         from .greedy import Greedy
         return Greedy
     
-    elif method == 'train':
-        if model_structure == 'qwen2':
-            from .train import ModelForTraining
-            return ModelForTraining
+    elif method == 'pretrain':
+        from .pretrain import ModelForTraining
+        return ModelForTraining
+    
+    elif method == 'cotrain':
+        from .cotrain import ModelForTraining
+        return ModelForTraining
 
     elif method =='eval':
         from .eval import ModelForEvaluation

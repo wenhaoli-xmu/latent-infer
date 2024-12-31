@@ -8,9 +8,11 @@ from flash_attn import flash_attn_func
 import json
 
 
-def model_forward(self, input_ids, kv_cache, reduce_logits=True, **kwargs):
 
-    hidden_states, kv_cache = self.model(input_ids, kv_cache)
+
+def model_forward(self, input_ids, kv_cache, pos, reduce_logits=True, **kwargs):
+
+    hidden_states, kv_cache = self.model(input_ids, kv_cache, pos)
 
     if reduce_logits:
         hidden_states = hidden_states[:, -1:, :]
@@ -21,7 +23,8 @@ def model_forward(self, input_ids, kv_cache, reduce_logits=True, **kwargs):
 
 
 
-def model_model_forward(self, input_ids, kv_cache):
+
+def model_model_forward(self, input_ids, kv_cache, pos):
     if input_ids is None:
         input_embeds = self.latent_query
     else:
@@ -35,19 +38,22 @@ def model_model_forward(self, input_ids, kv_cache):
     for layer in self.layers:
         hidden_states, kv_cache = layer(
             hidden_states, 
-            kv_cache)
+            kv_cache,
+            pos)
 
     hidden_states = self.norm(hidden_states)
 
     return hidden_states, kv_cache
 
 
-def layer_forward(self, hidden_states, kv_cache):    
+
+
+def layer_forward(self, hidden_states, kv_cache, pos):    
     # do the self attention mechanism
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
 
-    hidden_states, kv_cache = self.self_attn(hidden_states, kv_cache)
+    hidden_states, kv_cache = self.self_attn(hidden_states, kv_cache, pos)
     hidden_states = residual + hidden_states
     
     # do the feed forward
@@ -60,7 +66,9 @@ def layer_forward(self, hidden_states, kv_cache):
 
 
 
-def self_attn_forward(self, hidden_states, kv_cache):
+
+
+def self_attn_forward(self, hidden_states, kv_cache, pos):
 
     num_heads, embed_dim = self.config.num_attention_heads, self.config.hidden_size
     num_kv_heads = self.config.num_key_value_heads
@@ -75,6 +83,14 @@ def self_attn_forward(self, hidden_states, kv_cache):
     keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim)
     vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim)
 
+
+    if pos is not None:
+        len1 = self.config.max_position_embeddings if hasattr(self.config, "max_position_embeddings") else 0
+        len2 = max(ques.shape[-2], keys.shape[-2])
+        cos, sin = self.rotary_emb(keys, seq_len=max(len1, len2))
+        ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin, pos=pos)
+
+
     if kv_cache[self.layer_idx][0] is not None:
         keys = torch.cat([kv_cache[self.layer_idx][0], keys], dim=-2)
         vals = torch.cat([kv_cache[self.layer_idx][1], vals], dim=-2)
@@ -85,17 +101,9 @@ def self_attn_forward(self, hidden_states, kv_cache):
     keys_expand = repeat_kv(keys, num_kv_group)
     vals_expand = repeat_kv(vals, num_kv_group)
 
-    len1 = self.config.max_position_embeddings if hasattr(self.config, "max_position_embeddings") else 0
-    len2 = max(ques.shape[-2], keys_expand.shape[-2])
-    cos, sin = self.rotary_emb(keys_expand, seq_len=max(len1, len2))
-
-    ques, keys_expand = check_and_apply_qk_rope(ques, keys_expand, cos, sin)
-
-
     ques = ques.transpose(1,2)
     keys_expand = keys_expand.transpose(1,2)
     vals_expand = vals_expand.transpose(1,2)
-
 
     attn_output = flash_attn_func(
         q=ques, 
@@ -107,6 +115,8 @@ def self_attn_forward(self, hidden_states, kv_cache):
     attn_output = self.o_proj(attn_output)
 
     return attn_output, kv_cache
+
+
 
 
 class ModelForTraining(torch.nn.Module):
@@ -168,7 +178,7 @@ class ModelForTraining(torch.nn.Module):
         for layer in self.model.model.layers:
             layer.forward = types.MethodType(layer_forward, layer)
             layer.self_attn.forward = types.MethodType(self_attn_forward, layer.self_attn)
-    
+
 
 
     def _maybe_enable_lora(self):
@@ -181,7 +191,7 @@ class ModelForTraining(torch.nn.Module):
                 target_modules=['q_proj', 'v_proj']
             )
             self.model = get_peft_model(self.model, peft_config)
-        
+
 
     def _get_layers(self):
         if self.conf['lora']['enable'] is True:
@@ -214,11 +224,16 @@ class ModelForTraining(torch.nn.Module):
         return params
 
 
-    def _compute_nll_and_flag(self, hidden_states):
+    def _compute_nll_and_flag(self, hidden_states, fix_prob):
         logits = self.model.flag_head(hidden_states.detach()).ravel().float()
         nll = -torch.nn.functional.logsigmoid(logits)
         probs = logits.detach().sigmoid()
-        flag = (probs > torch.rand(1, dtype=probs.dtype, device=probs.device)).item()
+
+        if fix_prob is not None:
+            flag = (torch.rand(1) > (1 - fix_prob)).item()
+        else:
+            flag = (probs > torch.rand(1, dtype=probs.dtype, device=probs.device)).item()
+
         return nll if flag else logits + nll, flag
 
     
@@ -234,18 +249,31 @@ class ModelForTraining(torch.nn.Module):
         torch.save([maybe_zero_3(param) for param in self.ft_params()], ckp)
 
 
-    def forward(self, input_ids=None, label=None, kv_cache=None, **kwargs):
+    def init_latent_query(self, eos_token_id):
+        if self.conf['lora']['enable'] is True:
+            latent_query = self.model.model.model.latent_query
+            eos_embed = self.model.model.model.embed_tokens.weight[eos_token_id].data
+        else:
+            
+            latent_query = self.model.model.latent_query
+            eos_embed = self.model.model.embed_tokens.weight[eos_token_id].data
+
+        latent_query.data.copy_(eos_embed.reshape_as(latent_query.data))
+
+
+    def forward(self, input_ids=None, label=None, kv_cache=None, pos=-1, fix_prob=None, **kwargs):
         hidden_states, logits, kv_cache = self.model(
             input_ids=input_ids, 
-            kv_cache=kv_cache)
+            kv_cache=kv_cache,
+            pos=pos)
         
-        nll, flag = self._compute_nll_and_flag(hidden_states)
+        nll, flag = self._compute_nll_and_flag(hidden_states, fix_prob)
 
         loss = None
         if label is not None:
             label = torch.tensor(label, dtype=torch.int64, device='cuda')
             loss = torch.nn.functional.cross_entropy(logits.ravel(), label)
-                
+
 
         return dict(
             kv_cache=kv_cache,

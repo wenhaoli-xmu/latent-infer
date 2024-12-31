@@ -20,11 +20,18 @@ def maybe_zero_3(param, ignore_status=False, name=None):
 
 
 def apply_rotary_pos_emb(mat, cos, sin, position_ids, unsqueeze_dim=1):
+    nope_mask = position_ids == -100
+    position_ids = torch.masked_fill(position_ids, nope_mask, value=0)
+
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    mat_embed = (mat * cos) + (rotate_half(mat) * sin)
 
-    return mat_embed
+    mat_embed = (mat * cos) + (rotate_half(mat) * sin)
+    mat_embed = mat_embed.transpose(1,2)
+    mat = mat.transpose(1,2)
+    mat[~nope_mask, :, :] = mat_embed[~nope_mask, :, :]
+
+    return mat.transpose(1,2)
 
 
 def new_posid(num_token: int, device, dtype, bsz):
@@ -33,17 +40,13 @@ def new_posid(num_token: int, device, dtype, bsz):
     return appendix
 
 
-def check_and_apply_qk_rope(query, key, cos, sin, pos=0):
-    batch_size, num_heads, num_query, head_dim = query.shape
-    num_kv = key.shape[-2]
+def check_and_apply_qk_rope(query, key, cos, sin, position_ids):
 
-    assert key.shape == (batch_size, num_heads, num_kv, head_dim)
+    # query: (b, h, n, d)
+    # position_ids: (b, n)
 
-    new_posid_spec = partial(new_posid, device=query.device, dtype=query.dtype, bsz=batch_size)
-    pos_list = new_posid_spec(max(num_kv, pos))
-
-    Q = apply_rotary_pos_emb(query, cos, sin, pos_list[:,-num_query:])
-    K = apply_rotary_pos_emb(key, cos, sin, pos_list[:,-num_kv:])
+    Q = apply_rotary_pos_emb(query, cos, sin, position_ids)
+    K = apply_rotary_pos_emb(key, cos, sin, position_ids)
 
     return Q, K
 

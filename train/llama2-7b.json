@@ -1,6 +1,6 @@
 {
     "model": {
-        "model_name": "unsloth/Qwen2.5-0.5B",
+        "model_name": "meta-llama/Llama-2-7b-hf",
         "model_dtype": "bf16",
         "model_method": "pretrain",
         "model_structure": null,
@@ -11,7 +11,7 @@
     },
 
     "train": {
-        "train_iters": 65536,
+        "train_iters": 10000,
         "max_lr": 1e-4,
         "warmup": 0.01,
         "beta1": 0.9,
