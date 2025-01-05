@@ -232,6 +232,8 @@ class History:
 
             print(info, flush=True)
 
+        self.step += 1
+
     def summary(self):
         if dist.get_rank() == 0:
             plt.figure()
@@ -239,25 +241,25 @@ class History:
             plt.title("filter-1")
             plt.plot(self.loss)
             plt.plot(self.baseline)
-            plt.legend(['loss', 'ratio', 'baseline'])
+            plt.legend(['loss', 'baseline'])
 
             plt.subplot(222)
             plt.title("filter-4")
             plt.plot(average_filter(self.loss, 4))
             plt.plot(average_filter(self.baseline, 4))
-            plt.legend(['loss', 'ratio', 'baseline'])
+            plt.legend(['loss', 'baseline'])
 
             plt.subplot(223)
             plt.title("filter-16")
             plt.plot(average_filter(self.loss, 16))
             plt.plot(average_filter(self.baseline, 16))
-            plt.legend(['loss', 'ratio', 'baseline'])
+            plt.legend(['loss', 'baseline'])
 
             plt.subplot(224)
             plt.title("filter-64")
             plt.plot(average_filter(self.loss, 64))
             plt.plot(average_filter(self.baseline, 64))
-            plt.legend(['loss', 'ratio', 'baseline'])
+            plt.legend(['loss', 'baseline'])
 
 
             plt.savefig(self.path.format(step=self.step))
