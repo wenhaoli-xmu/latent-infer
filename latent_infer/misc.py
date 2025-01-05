@@ -212,7 +212,8 @@ class History:
         self.baseline = []
         self.step = 0
         self.path = "history-{step}.jpg"
-        self.template = "step-{step:<5d} | loss(baseline): {baseline:.3f} | loss: {loss}"
+        self.template = "step-{step:<5d} | loss(baseline): {baseline:.3f} | loss: {loss} | res: {residual}"
+        self.residual = 0
 
     def _reset(self):
         self.loss = []
@@ -222,16 +223,22 @@ class History:
         self.loss.append(loss)
         self.baseline.append(baseline)
 
+        
+
         if dist.get_rank() == 0:
             loss = max(loss, baseline - 0.2)
             loss = min(loss, baseline + 0.2)
-            color = (loss - baseline + 0.2) / 0.4
-            color = max(min(color, 1.0), 0.0)
+            color_loss = (loss - baseline + 0.2) / 0.4
+            color_loss = max(min(color_loss, 1.0), 0.0)
+
+            self.residual = self.residual * 0.99 + (loss - baseline) * 0.01
+            color_residual = (max(min(self.residual, 0.1), -0.1) + 0.1) / 0.2
 
             info = self.template.format(
                 step=self.step,
                 baseline=baseline,
-                loss=gradient_color(f"{loss:.3f}", color))
+                loss=gradient_color(f"{loss:.3f}", color_loss),
+                residual=gradient_color(f"{self.residual:.3f}", color_residual))
 
             print(info, flush=True)
 
@@ -268,3 +275,50 @@ class History:
             plt.savefig(self.path.format(step=self.step))
 
         dist.barrier()
+
+
+class GradientAccumulator:
+    def __init__(self, optimizer, params, accum_steps=1):
+        self.params = params
+        self.num_grads = 0
+        self.grad = None
+        self.accum_steps = accum_steps
+        self.optim = optimizer
+
+
+    def step(self):
+        flat_grad = []
+
+        for param in self.params:
+            flat_grad.append(param.grad.data.ravel())
+
+        grad = torch.cat(flat_grad)
+
+        if self.grad is not None:
+            self.grad += grad
+        else:
+            self.grad = grad
+
+        self.num_grads += 1
+
+
+        if self.num_grads % self.accum_steps == 0:
+            self._copy_and_reset()
+            self.optim.step()
+
+    
+    def zero_grad(self):
+        for param in self.params:
+            param.grad = None
+
+    
+    def _copy_and_reset(self):
+        start = 0
+        for param in self.params:
+            end = start + param.numel()
+            grad_slice = self.grad[start:end]
+            param.grad = grad_slice.reshape_as(param)
+            start = end
+
+        self.grad = None
+        self.num_grads = 0

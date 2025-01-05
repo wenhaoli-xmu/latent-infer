@@ -10,7 +10,8 @@ from latent_infer.misc import (
     get_env_conf, 
     get_torch_dtype, 
     get_optimizer_and_lr_adjuster,
-    History)
+    History,
+    GradientAccumulator)
 
 
 def build_dataset(env_conf, tokenizer):
@@ -104,6 +105,7 @@ if __name__ == '__main__':
     parser.add_argument("--env_conf", type=str, required=True)
     parser.add_argument("--prob", type=float, default=0.5)
     parser.add_argument("--last_n", type=int, default=16)
+    parser.add_argument("--accum_steps", type=int, default=1)
     args = parser.parse_args()
 
 
@@ -122,6 +124,7 @@ if __name__ == '__main__':
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(
         **env_conf['train'], 
         params=params)
+    optimizer = GradientAccumulator(optimizer, params, accum_steps=args.accum_steps)
 
 
     # build dataset
@@ -184,7 +187,7 @@ if __name__ == '__main__':
             kv_cache_bkp = copy_kv_cache(outputs['kv_cache'])
 
             # latent infer
-            while torch.rand(1).item() > (1 - args.prob):
+            while torch.rand(1).item() < args.prob:
                 inputs = dict(
                     input_ids=None,
                     input_embeds=outputs['latent_states'],

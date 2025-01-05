@@ -4,4 +4,5 @@ torchrun \
     train/main.py \
     --env_conf train/qwen2.5-0.5b.json \
     --prob 0.5 \
-    --last_n 16
+    --last_n 16 \
+    --accum_steps 64

@@ -12,10 +12,10 @@
 
     "train": {
         "train_iters": 65536,
-        "max_lr": 0.0001,
-        "warmup": 0.001,
+        "max_lr": 0.00001,
+        "warmup": 0.1,
         "beta1": 0.9,
-        "beta2": 0.98,
+        "beta2": 0.999,
         "weight_decay": 0.05,
         "corpus": [
             {
