@@ -223,12 +223,14 @@ class History:
         self.baseline.append(baseline)
 
         if dist.get_rank() == 0:
-            sim = min(abs((loss-baseline)), 1.0)
+            loss = max(loss, baseline - 0.2)
+            loss = min(loss, baseline + 0.2)
+            color = (loss - baseline + 0.2) / 0.4
 
             info = self.template.format(
                 step=self.step,
                 baseline=baseline,
-                loss=gradient_color(f"{loss:.3f}", sim))
+                loss=gradient_color(f"{loss:.3f}", color))
 
             print(info, flush=True)
 

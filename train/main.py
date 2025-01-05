@@ -1,6 +1,5 @@
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
 import argparse, random, numpy, os
@@ -59,11 +58,17 @@ def backend_setup():
     torch.cuda.set_device(local_rank)
 
 
-
 def backend_cleanup():
     dist.destroy_process_group()
 
 
+def copy_kv_cache(kv_cache):
+    kv_cache_copy = []
+    for i in range(len(kv_cache)):
+        k = kv_cache[i][0].detach()
+        v = kv_cache[i][1].detach()
+        kv_cache_copy.append([k,v])
+    return kv_cache_copy
 
 
 if __name__ == '__main__':
@@ -133,46 +138,51 @@ if __name__ == '__main__':
         # pre-fill first token
         with torch.no_grad():
             inputs = dict(
-                input_ids=input_ids[:,:skip-1],
+                input_ids=input_ids[:,:skip],
                 input_embeds=None,
+                mix_states=None,
                 kv_cache=None)
             outputs = model(**inputs)
 
-        inputs = dict(
-            input_ids=input_ids[:,skip-1:skip],
-            input_embeds=None,
-            kv_cache=outputs['kv_cache'])
-        outputs = model(**inputs)
-
         loss = 0
+        num_loss = 0
 
         for i in range(skip, input_ids.shape[-1]):
-
-            # latent infer
-            latent_steps = 0
-            while torch.rand(1).item() > (1 - args.prob):
-                inputs = dict(
-                    input_ids=None,
-                    input_embeds=outputs['latent_states'],
-                    kv_cache=outputs['kv_cache'])
-                outputs = model(**inputs)
-                latent_steps += 1
 
             # ordinal infer
             inputs = dict(
                 input_ids=input_ids[:,i:i+1],
                 input_embeds=None, 
+                mix_states=None,
                 kv_cache=outputs['kv_cache'])
             outputs = model(**inputs)
-            
-            # accumulate loss
-            logits = outputs['logits'].flatten(0,1)
-            label = labels[:, i:i+1].ravel()
-            loss += torch.nn.functional.cross_entropy(logits, label)
+
+            mix_states = outputs['hidden_states']
+            kv_cache_bkp = copy_kv_cache(outputs['kv_cache'])
+
+            # latent infer
+            num_latent_steps = 0
+            while torch.rand(1).item() > (1 - args.prob):
+                inputs = dict(
+                    input_ids=None,
+                    input_embeds=outputs['latent_states'],
+                    mix_states=mix_states,
+                    kv_cache=outputs['kv_cache'])
+                outputs = model(**inputs)
+
+                # accumulate loss
+                logits = outputs['logits'].flatten(0,1)
+                label = labels[:, i:i+1].ravel()
+                loss += torch.nn.functional.cross_entropy(logits, label)
+
+                num_latent_steps += 1
+
+            num_loss += num_latent_steps
+            outputs['kv_cache'] = kv_cache_bkp
 
 
         # backward propagation
-        loss /= args.last_n
+        loss /= num_loss
         loss.backward()
 
         for param in params:
@@ -187,6 +197,7 @@ if __name__ == '__main__':
             inputs = dict(
                 input_ids=input_ids,
                 input_embeds=None,
+                mix_states=None,
                 kv_cache=None)
             outputs = model(**inputs)
 

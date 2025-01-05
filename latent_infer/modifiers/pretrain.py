@@ -6,14 +6,22 @@ from .utils import check_and_apply_qk_rope
 from flash_attn import flash_attn_func
 
 
-def model_forward(self, input_ids, input_embeds, kv_cache):
+def model_forward(self, input_ids, input_embeds, mix_states, kv_cache):
 
     hidden_states, kv_cache = self.model(input_ids, input_embeds, kv_cache)
     latent_states = self.latent_head(hidden_states[..., -1:, :])
-    logits = self.lm_head(hidden_states)
 
+    # mix hidden states with latent states for inference
+    if mix_states is not None:
+        mixed_states = self.mixer(mix_states, latent_states)
+        logits = self.lm_head(mixed_states)
+    else:
+        logits = self.lm_head(hidden_states)
+
+    # return
     return dict(
         logits=logits,
+        hidden_states=hidden_states[...,-1:,:],
         latent_states=latent_states,
         kv_cache=kv_cache,)
 
@@ -138,43 +146,36 @@ class LatentHead(torch.nn.Module):
         return x
     
 
-# class StatesMixer(torch.nn.Module):
-#     def __init__(self, hidden_size):
-#         super().__init__()
+class StatesMixer(torch.nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
 
-#         self.lin1 = torch.nn.Linear(2 * hidden_size, 2 * hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
-#         self.act1 = torch.nn.ReLU()
+        self.lin1 = torch.nn.Linear(2 * hidden_size, 2 * hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.act1 = torch.nn.ReLU()
         
-#         self.lin2 = torch.nn.Linear(2 * hidden_size, 2 * hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
-#         self.act2 = torch.nn.ReLU()
+        self.lin2 = torch.nn.Linear(2 * hidden_size, 2 * hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.act2 = torch.nn.ReLU()
 
-#         self.lin3 = torch.nn.Linear(2 * hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.lin3 = torch.nn.Linear(2 * hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
 
-#         torch.nn.init.zeros_(self.lin1.weight.data)
-#         torch.nn.init.zeros_(self.lin2.weight.data)
-#         torch.nn.init.zeros_(self.lin3.weight.data)
-
-#         torch.nn.init.eye_(self.lin1.weight.data[:hidden_size, :hidden_size])
-#         torch.nn.init.eye_(self.lin2.weight.data[:hidden_size, :hidden_size])
-#         torch.nn.init.eye_(self.lin3.weight.data[:hidden_size, :hidden_size])
+        torch.nn.init.zeros_(self.lin1.weight.data)
+        torch.nn.init.zeros_(self.lin2.weight.data)
+        torch.nn.init.zeros_(self.lin3.weight.data)
+        torch.nn.init.eye_(self.lin3.weight.data[:, :hidden_size])
 
 
-#     def forward(self, x, y):
-#         """
-#         x: normal logits
-#         y: latent logits
-#         """
-#         z = torch.cat([x, y], dim=-1)
+    def forward(self, x, y):
+        """
+        x: normal logits
+        y: latent logits
+        """
+        z = torch.cat([x, y], dim=-1)
         
-#         w = self.lin1(z)
-#         w = self.act1(w)
+        z = z + self.act1(self.lin1(z))
+        z = z + self.act2(self.lin2(z))
+        z = self.lin3(z)
 
-#         w = self.lin2(w)
-#         w = self.act2(w)
-
-#         w = self.lin3(w)
-
-#         return w
+        return z
 
 
 class ModelForTraining(Modifier):
@@ -191,9 +192,8 @@ class ModelForTraining(Modifier):
     def _replace_foward_functions(self, model):
         model.forward = types.MethodType(model_forward, model)
         model.model.forward = types.MethodType(model_model_forward, model.model)
-
         model.latent_head = LatentHead(model.lm_head.in_features)
-        # model.mixer = StatesMixer(model.lm_head.in_features)
+        model.mixer = StatesMixer(model.lm_head.in_features)
 
         for layer in model.model.layers:
             layer.forward = types.MethodType(layer_forward, layer)
@@ -204,4 +204,5 @@ class ModelForTraining(Modifier):
 
     def ft_params(self):
         params = list(self.model.latent_head.parameters())
+        params += list(self.model.mixer.parameters())
         return params
