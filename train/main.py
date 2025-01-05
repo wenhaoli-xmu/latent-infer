@@ -71,6 +71,29 @@ def copy_kv_cache(kv_cache):
     return kv_cache_copy
 
 
+class Loss:
+    def __init__(self):
+        self.loss_for_backward = 0
+        self.loss_for_comparison = 0
+        self.num_loss_for_bwd = 0
+        self.num_loss_for_cmp = 0
+
+    def update_inside(self, loss):
+        self.loss_for_backward += loss
+        self.num_loss_for_bwd += 1
+
+    def update_outside(self, loss):
+        self.loss_for_comparison += loss
+        self.num_loss_for_cmp += 1
+
+    def backward(self):
+        (self.loss_for_backward / self.num_loss_for_bwd).backward()
+
+    def item(self):
+        return self.loss_for_comparison / self.num_loss_for_cmp
+
+
+
 if __name__ == '__main__':
 
 
@@ -144,8 +167,8 @@ if __name__ == '__main__':
                 kv_cache=None)
             outputs = model(**inputs)
 
-        loss = 0
-        num_loss = 0
+
+        loss = Loss()
 
         for i in range(skip, input_ids.shape[-1]):
 
@@ -161,7 +184,6 @@ if __name__ == '__main__':
             kv_cache_bkp = copy_kv_cache(outputs['kv_cache'])
 
             # latent infer
-            num_latent_steps = 0
             while torch.rand(1).item() > (1 - args.prob):
                 inputs = dict(
                     input_ids=None,
@@ -173,16 +195,19 @@ if __name__ == '__main__':
                 # accumulate loss
                 logits = outputs['logits'].flatten(0,1)
                 label = labels[:, i:i+1].ravel()
-                loss += torch.nn.functional.cross_entropy(logits, label)
+                loss_value = torch.nn.functional.cross_entropy(logits, label)
+                loss.update_inside(loss_value)
 
-                num_latent_steps += 1
-
-            num_loss += num_latent_steps
             outputs['kv_cache'] = kv_cache_bkp
 
+            with torch.no_grad():
+                logits = outputs['logits'].flatten(0,1)
+                label = labels[:, i:i+1].ravel()
+                loss_value = torch.nn.functional.cross_entropy(logits, label)
+            loss.update_outside(loss_value)
+            
 
         # backward propagation
-        loss /= num_loss
         loss.backward()
 
         for param in params:

@@ -226,6 +226,7 @@ class History:
             loss = max(loss, baseline - 0.2)
             loss = min(loss, baseline + 0.2)
             color = (loss - baseline + 0.2) / 0.4
+            color = max(min(color, 1.0), 0.0)
 
             info = self.template.format(
                 step=self.step,
