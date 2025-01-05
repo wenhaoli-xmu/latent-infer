@@ -3,6 +3,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from .modifiers import get_modifier
 from functools import partial
 import os, math
+import matplotlib.pyplot as plt
 
 
 from torch import distributed as dist
@@ -190,3 +191,75 @@ class PolicyGradient:
     def prepare(self):
         self._copy_grad()
         self._grad = None
+
+
+def average_filter(x, window):
+    y = []
+    w = []
+
+    for elem in x:
+        w.append(elem)
+        if len(w) == window:
+            y.append(sum(w) / len(w))
+            w.pop(0)
+
+    return y
+
+
+class History:
+    def __init__(self):
+        self.loss = []
+        self.baseline = []
+        self.step = 0
+        self.path = "history-{step}.jpg"
+        self.template = "step-{step:<5d} | loss(baseline): {baseline:.3f} | loss: {loss}"
+
+    def _reset(self):
+        self.loss = []
+        self.baseline = []
+
+    def update(self, loss, baseline):
+        self.loss.append(loss)
+        self.baseline.append(baseline)
+
+        if dist.get_rank() == 0:
+            sim = min(abs((loss-baseline)), 1.0)
+
+            info = self.template.format(
+                step=self.step,
+                baseline=baseline,
+                loss=gradient_color(f"{loss:.3f}", sim))
+
+            print(info, flush=True)
+
+    def summary(self):
+        if dist.get_rank() == 0:
+            plt.figure()
+            plt.subplot(221)
+            plt.title("filter-1")
+            plt.plot(self.loss)
+            plt.plot(self.baseline)
+            plt.legend(['loss', 'ratio', 'baseline'])
+
+            plt.subplot(222)
+            plt.title("filter-4")
+            plt.plot(average_filter(self.loss, 4))
+            plt.plot(average_filter(self.baseline, 4))
+            plt.legend(['loss', 'ratio', 'baseline'])
+
+            plt.subplot(223)
+            plt.title("filter-16")
+            plt.plot(average_filter(self.loss, 16))
+            plt.plot(average_filter(self.baseline, 16))
+            plt.legend(['loss', 'ratio', 'baseline'])
+
+            plt.subplot(224)
+            plt.title("filter-64")
+            plt.plot(average_filter(self.loss, 64))
+            plt.plot(average_filter(self.baseline, 64))
+            plt.legend(['loss', 'ratio', 'baseline'])
+
+
+            plt.savefig(self.path.format(step=self.step))
+
+        dist.barrier()

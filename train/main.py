@@ -4,14 +4,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
 import argparse, random, numpy, os
-from functools import partial
 
 from corpus import get_processor, RandomSampleCorpus
 from latent_infer.misc import (
     get_model_and_tokenizer,
     get_env_conf, 
     get_torch_dtype, 
-    get_optimizer_and_lr_adjuster)
+    get_optimizer_and_lr_adjuster,
+    History)
 
 
 def build_dataset(env_conf, tokenizer):
@@ -65,6 +65,7 @@ def backend_cleanup():
 
 
 
+
 if __name__ == '__main__':
 
 
@@ -73,7 +74,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env_conf", type=str, required=True)
-    parser.add_argument("--prob", type=float, default=0.8)
+    parser.add_argument("--prob", type=float, default=0.5)
     parser.add_argument("--last_n", type=int, default=16)
     args = parser.parse_args()
 
@@ -118,6 +119,9 @@ if __name__ == '__main__':
     sampler.set_epoch(0)
 
 
+    history = History()
+
+
     for step, batch in enumerate(loader):
         lr_adjuster(step=step)
         optimizer.zero_grad()
@@ -137,7 +141,7 @@ if __name__ == '__main__':
         inputs = dict(
             input_ids=input_ids[:,skip-1:skip],
             input_embeds=None,
-            kv_cache=None)
+            kv_cache=outputs['kv_cache'])
         outputs = model(**inputs)
 
         loss = 0
@@ -160,7 +164,6 @@ if __name__ == '__main__':
                 input_embeds=None, 
                 kv_cache=outputs['kv_cache'])
             outputs = model(**inputs)
-
             
             # accumulate loss
             logits = outputs['logits'].flatten(0,1)
@@ -190,16 +193,11 @@ if __name__ == '__main__':
             labels[:, :skip] = -100
             baseline = torch.nn.functional.cross_entropy(outputs['logits'].flatten(0,1), labels.ravel())
 
-
-        if dist.get_rank() == 0:
-            print(
-                f"step-{step:<5d} | "
-                f"baseline: {baseline.item():>.3f} | "
-                f"loss: {loss.item():>.3f}",
-                flush=True)
+        history.update(loss.item(), baseline.item())
 
 
     if dist.get_rank() == 0:
+        history.summary()
         model.save_checkpoint()
 
 

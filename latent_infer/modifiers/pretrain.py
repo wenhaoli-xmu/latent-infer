@@ -7,15 +7,15 @@ from flash_attn import flash_attn_func
 
 
 def model_forward(self, input_ids, input_embeds, kv_cache):
-    hidden_states, kv_cache = self.model(input_ids, input_embeds, kv_cache)
 
-    logits = self.lm_head(hidden_states)
+    hidden_states, kv_cache = self.model(input_ids, input_embeds, kv_cache)
     latent_states = self.latent_head(hidden_states[..., -1:, :])
+    logits = self.lm_head(hidden_states)
 
     return dict(
         logits=logits,
         latent_states=latent_states,
-        kv_cache=kv_cache)
+        kv_cache=kv_cache,)
 
 
 
@@ -108,6 +108,75 @@ def self_attn_forward(self, hidden_states, kv_cache):
     return attn_output, kv_cache
 
 
+class LatentHead(torch.nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+
+        self.lin1 = torch.nn.Linear(hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.act1 = torch.nn.ReLU()
+
+        self.lin2 = torch.nn.Linear(hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.act2 = torch.nn.ReLU()
+
+        self.lin3 = torch.nn.Linear(hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.act3 = torch.nn.ReLU()
+
+        self.lin4 = torch.nn.Linear(hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.act4 = torch.nn.ReLU()
+
+        torch.nn.init.xavier_uniform_(self.lin1.weight.data)
+        torch.nn.init.xavier_uniform_(self.lin2.weight.data)
+        torch.nn.init.xavier_uniform_(self.lin3.weight.data)
+        torch.nn.init.xavier_uniform_(self.lin4.weight.data)
+    
+
+    def forward(self, x):
+        x = x + self.act1(self.lin1(x))
+        x = x + self.act2(self.lin2(x))
+        x = x + self.act3(self.lin3(x))
+        x = x + self.act4(self.lin4(x))
+        return x
+    
+
+# class StatesMixer(torch.nn.Module):
+#     def __init__(self, hidden_size):
+#         super().__init__()
+
+#         self.lin1 = torch.nn.Linear(2 * hidden_size, 2 * hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+#         self.act1 = torch.nn.ReLU()
+        
+#         self.lin2 = torch.nn.Linear(2 * hidden_size, 2 * hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+#         self.act2 = torch.nn.ReLU()
+
+#         self.lin3 = torch.nn.Linear(2 * hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+
+#         torch.nn.init.zeros_(self.lin1.weight.data)
+#         torch.nn.init.zeros_(self.lin2.weight.data)
+#         torch.nn.init.zeros_(self.lin3.weight.data)
+
+#         torch.nn.init.eye_(self.lin1.weight.data[:hidden_size, :hidden_size])
+#         torch.nn.init.eye_(self.lin2.weight.data[:hidden_size, :hidden_size])
+#         torch.nn.init.eye_(self.lin3.weight.data[:hidden_size, :hidden_size])
+
+
+#     def forward(self, x, y):
+#         """
+#         x: normal logits
+#         y: latent logits
+#         """
+#         z = torch.cat([x, y], dim=-1)
+        
+#         w = self.lin1(z)
+#         w = self.act1(w)
+
+#         w = self.lin2(w)
+#         w = self.act2(w)
+
+#         w = self.lin3(w)
+
+#         return w
+
+
 class ModelForTraining(Modifier):
 
 
@@ -123,16 +192,8 @@ class ModelForTraining(Modifier):
         model.forward = types.MethodType(model_forward, model)
         model.model.forward = types.MethodType(model_model_forward, model.model)
 
-        # build latent head
-        model.latent_head = torch.nn.Linear(
-            in_features=model.lm_head.in_features,
-            out_features=model.lm_head.in_features,
-            bias=False,
-            device='cuda',
-            dtype=torch.bfloat16)
-        
-        torch.nn.init.normal_(model.latent_head.weight.data, std=0.01)
-
+        model.latent_head = LatentHead(model.lm_head.in_features)
+        # model.mixer = StatesMixer(model.lm_head.in_features)
 
         for layer in model.model.layers:
             layer.forward = types.MethodType(layer_forward, layer)

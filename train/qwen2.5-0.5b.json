@@ -1,6 +1,6 @@
 {
     "model": {
-        "model_name": "unsloth/Qwen2.5-7B",
+        "model_name": "unsloth/Qwen2.5-0.5B",
         "model_dtype": "bf16",
         "model_method": "pretrain",
         "model_structure": null,
@@ -11,22 +11,17 @@
     },
 
     "train": {
-        "train_iters": 20000,
-        "max_lr": 0.01,
-        "warmup": 0,
+        "train_iters": 65536,
+        "max_lr": 0.0001,
+        "warmup": 0.001,
         "beta1": 0.9,
-        "beta2": 0.95,
+        "beta2": 0.98,
         "weight_decay": 0.05,
         "corpus": [
             {
                 "data": "data/slimpajama/arxiv.json",
                 "conf": "config/slimpajama-trunc512.json",
-                "partition": 0.5
-            },
-            {
-                "data": "data/slimpajama/book.json",
-                "conf": "config/slimpajama-trunc512.json",
-                "partition": 0.5
+                "partition": 1.0
             }
         ]
     }
