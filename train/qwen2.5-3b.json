@@ -4,7 +4,7 @@
         "model_dtype": "bf16",
         "model_method": "pretrain",
         "model_structure": null,
-        "save_ckp": "ckp/model.pth",
+        "save_ckp": null,
         "load_ckp": null,
         "config": null,
         "device_map": null

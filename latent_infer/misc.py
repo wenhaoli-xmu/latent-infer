@@ -112,8 +112,10 @@ def get_optimizer_and_lr_adjuster(max_lr, train_iters, warmup, weight_decay, bet
     optim = torch.optim.AdamW(
         params=params,
         betas=[beta1, beta2],
-        weight_decay=weight_decay
-    )
+        weight_decay=weight_decay)
+
+    assert train_iters % dist.get_world_size() == 0
+    train_iters = train_iters / dist.get_world_size()
 
     lr_adjuster = partial(adjust_lr, optim=optim, total=train_iters, max_lr=max_lr, min_lr=0, restart=1, warmup=warmup, plateau=0)
 
@@ -249,7 +251,7 @@ class History:
 
         self.step += 1
 
-    def summary(self):
+    def summary(self, filename):
         if dist.get_rank() == 0:
             plt.figure()
             plt.subplot(221)
@@ -276,9 +278,9 @@ class History:
             plt.plot(average_filter(self.baseline, 64))
             plt.legend(['loss', 'baseline'])
 
-            plt.savefig(f"history-{self.step}.jpg")
+            plt.savefig(filename + '.jpg')
 
-            with open(f'history-{self.step}.json', 'w') as f:
+            with open(filename + '.json', 'w') as f:
                 import json
                 log_data = dict(
                     loss=self.loss,

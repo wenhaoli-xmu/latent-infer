@@ -22,8 +22,10 @@ if __name__ == "__main__":
 
     
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.tokenizer)
+    path = f"data/mul/mul{args.num_digits}.jsonl"
 
-    os.remove(f"data/mul/mul{args.num_digits}.jsonl")
+    if os.path.exists(path):
+        os.remove(path)
 
 
     for _ in range(args.num_data):
@@ -50,5 +52,5 @@ if __name__ == "__main__":
             input_ids=input_ids,
             labels=labels)
 
-        with open(f"data/mul/mul{args.num_digits}.jsonl", 'a+') as f:
+        with open(path, 'a+') as f:
             f.write(json.dumps(data) + '\n')

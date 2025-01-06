@@ -141,6 +141,7 @@ if __name__ == '__main__':
     parser.add_argument("--num_cot_tokens", type=int, default=3)
     parser.add_argument("--num_accum_steps", type=int, default=1)
     parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--id", type=str, required=True)
     args = parser.parse_args()
 
 
@@ -270,8 +271,7 @@ if __name__ == '__main__':
 
 
     if dist.get_rank() == 0:
-        history.summary()
-        model.save_checkpoint()
+        history.summary(args.id)
+        model.save_checkpoint(os.path.join("ckp", f"{args.id}.pth"))
 
-
-    backend_cleanup()
+    dist.barrier()
