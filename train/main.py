@@ -107,7 +107,7 @@ class Loss:
         (self.loss_for_backward / self.num_loss_for_bwd).backward()
 
     def item(self):
-        return self.loss_for_comparison / self.num_loss_for_cmp
+        return self.loss_for_comparison.item() / self.num_loss_for_cmp
     
 
 class MulData(Dataset):

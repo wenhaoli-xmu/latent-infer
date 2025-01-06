@@ -1,6 +1,6 @@
 {
     "model": {
-        "model_name": "unsloth/Qwen2.5-0.5B",
+        "model_name": "unsloth/Qwen2.5-3B",
         "model_dtype": "bf16",
         "model_method": "pretrain",
         "model_structure": null,
