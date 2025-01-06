@@ -5,4 +5,4 @@ torchrun \
     --env_conf train/qwen2.5-0.5b.json \
     --data_path data/mul/mul2.jsonl \
     --num_accum_steps 8 \
-    --num_cot_tokens 4
+    --num_cot_tokens 8

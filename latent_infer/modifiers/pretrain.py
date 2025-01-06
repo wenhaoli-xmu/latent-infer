@@ -4,6 +4,7 @@ from transformers.models.qwen2.modeling_qwen2 import repeat_kv
 from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope
 from flash_attn import flash_attn_func
+from copy import deepcopy
 
 
 def model_forward(self, input_ids, input_embeds, mix_states, kv_cache):
@@ -30,6 +31,7 @@ def model_forward(self, input_ids, input_embeds, mix_states, kv_cache):
 def model_model_forward(self, input_ids, input_embeds, kv_cache):
 
     assert input_ids is None or input_embeds is None
+    is_latent = input_ids is None and input_embeds is not None
 
     if input_embeds is None:
         input_embeds = self.embed_tokens(input_ids)
@@ -42,19 +44,24 @@ def model_model_forward(self, input_ids, input_embeds, kv_cache):
     for layer in self.layers:
         hidden_states, kv_cache = layer(
             hidden_states,
-            kv_cache)
+            kv_cache,
+            is_latent=is_latent)
 
     hidden_states = self.norm(hidden_states)
 
     return hidden_states, kv_cache
 
 
-def layer_forward(self, hidden_states, kv_cache):    
+def layer_forward(self, hidden_states, kv_cache, is_latent):    
     # do the self attention mechanism
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
 
-    hidden_states, kv_cache = self.self_attn(hidden_states, kv_cache)
+    if is_latent:
+        hidden_states, kv_cache = self.latent_self_attn(hidden_states, kv_cache)
+    else:
+        hidden_states, kv_cache = self.self_attn(hidden_states, kv_cache)
+
     hidden_states = residual + hidden_states
     
     # do the feed forward
@@ -179,10 +186,7 @@ class StatesMixer(torch.nn.Module):
 
 
 class ModelForTraining(Modifier):
-
-
     def __init__(self, model, save_ckp: str, load_ckp: str, config: str):
-
         self.get_conf(config)
         model = self._replace_foward_functions(model)
         model.train()
@@ -198,6 +202,7 @@ class ModelForTraining(Modifier):
         for layer in model.model.layers:
             layer.forward = types.MethodType(layer_forward, layer)
             layer.self_attn.forward = types.MethodType(self_attn_forward, layer.self_attn)
+            layer.latent_self_attn = deepcopy(layer.self_attn)
 
         return model
 
@@ -205,4 +210,8 @@ class ModelForTraining(Modifier):
     def ft_params(self):
         params = list(self.model.latent_head.parameters())
         params += list(self.model.mixer.parameters())
+        
+        for layer in self.model.model.layers:
+            params += list(layer.latent_self_attn.parameters())
+
         return params
