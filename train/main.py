@@ -1,8 +1,8 @@
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, DistributedSampler
+from torch.utils.data import ConcatDataset, DataLoader, DistributedSampler, Dataset
 import torch.distributed as dist
 
-import argparse, random, numpy, os
+import argparse, random, numpy, os, json
 
 from corpus import get_processor, RandomSampleCorpus
 from latent_infer.misc import (
@@ -31,15 +31,29 @@ def build_dataset(env_conf, tokenizer):
     return ConcatDataset(corpus)
 
 
+# def collate_fn(batch):
+#     input_ids = batch[0]['input_ids']
+#     input_ids = torch.tensor(input_ids, dtype=torch.int64, device='cuda').unsqueeze(0)
+
+#     labels = torch.zeros_like(input_ids)
+#     labels[..., :-1] = input_ids[..., 1:]
+
+#     input_ids = input_ids[..., :-1]
+#     labels = labels[..., :-1]
+
+#     return dict(
+#         input_ids=input_ids,
+#         labels=labels)
+
+
 def collate_fn(batch):
+    assert len(batch) == 1
+
     input_ids = batch[0]['input_ids']
     input_ids = torch.tensor(input_ids, dtype=torch.int64, device='cuda').unsqueeze(0)
 
-    labels = torch.zeros_like(input_ids)
-    labels[..., :-1] = input_ids[..., 1:]
-
-    input_ids = input_ids[..., :-1]
-    labels = labels[..., :-1]
+    labels = batch[0]['labels']
+    labels = torch.tensor(labels, dtype=torch.int64, device='cuda').unsqueeze(0)
 
     return dict(
         input_ids=input_ids,
@@ -88,10 +102,29 @@ class Loss:
         self.num_loss_for_cmp += 1
 
     def backward(self):
+        if self.num_loss_for_bwd == 0:
+            return
         (self.loss_for_backward / self.num_loss_for_bwd).backward()
 
     def item(self):
         return self.loss_for_comparison / self.num_loss_for_cmp
+    
+
+class MulData(Dataset):
+    def __init__(self, path):
+        
+        self.data = []
+        with open(path, 'r') as f:
+            for line in f:
+                self.data.append(json.loads(line))
+
+    def __len__(self):
+        return self.data.__len__()
+    
+
+    def __getitem__(self, i):
+        return self.data[i]
+
 
 
 
@@ -103,9 +136,11 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env_conf", type=str, required=True)
-    parser.add_argument("--prob", type=float, default=0.5)
-    parser.add_argument("--last_n", type=int, default=16)
-    parser.add_argument("--accum_steps", type=int, default=1)
+    # parser.add_argument("--prob", type=float, default=0.5)
+    # parser.add_argument("--last_n", type=int, default=16)
+    parser.add_argument("--num_cot_tokens", type=int, default=3)
+    parser.add_argument("--num_accum_steps", type=int, default=1)
+    parser.add_argument("--data_path", type=str, required=True)
     args = parser.parse_args()
 
 
@@ -124,16 +159,11 @@ if __name__ == '__main__':
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(
         **env_conf['train'], 
         params=params)
-    optimizer = GradientAccumulator(optimizer, params, accum_steps=args.accum_steps)
+    optimizer = GradientAccumulator(optimizer, params, accum_steps=args.num_accum_steps)
 
 
     # build dataset
-    if dist.get_rank() == 0:
-        corpus = build_dataset(env_conf, tokenizer)
-    dist.barrier()
-    if dist.get_rank() != 0:
-        corpus = build_dataset(env_conf, tokenizer)
-    dist.barrier()
+    corpus = MulData(args.data_path)
 
     sampler = DistributedSampler(
         corpus, 
@@ -154,12 +184,15 @@ if __name__ == '__main__':
 
 
     for step, batch in enumerate(loader):
+
         lr_adjuster(step=step)
         optimizer.zero_grad()
 
         input_ids = batch['input_ids']
         labels = batch['labels']
-        skip = input_ids.shape[-1] - args.last_n
+
+        skip = (labels == -100).count_nonzero()
+        # skip = input_ids.shape[-1] - args.last_n
 
         # pre-fill first token
         with torch.no_grad():
@@ -187,7 +220,7 @@ if __name__ == '__main__':
             kv_cache_bkp = copy_kv_cache(outputs['kv_cache'])
 
             # latent infer
-            while torch.rand(1).item() < args.prob:
+            for _ in range(args.num_cot_tokens):
                 inputs = dict(
                     input_ids=None,
                     input_embeds=outputs['latent_states'],
@@ -207,6 +240,7 @@ if __name__ == '__main__':
                 logits = outputs['logits'].flatten(0,1)
                 label = labels[:, i:i+1].ravel()
                 loss_value = torch.nn.functional.cross_entropy(logits, label)
+
             loss.update_outside(loss_value)
             
 

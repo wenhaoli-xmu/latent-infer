@@ -211,9 +211,17 @@ class History:
         self.loss = []
         self.baseline = []
         self.step = 0
-        self.path = "history-{step}.jpg"
-        self.template = "step-{step:<5d} | loss(baseline): {baseline:.3f} | loss: {loss} | res: {residual}"
-        self.residual = 0
+
+        self.template = "step-{step:<5d} | loss(baseline): {baseline:.3f} | loss: {loss} | loss - baseline (ema): {residual}"
+        self.residual_ema = 0
+
+        self.min_residual_ema = -0.1
+        self.max_residual_ema = 0.1
+
+        self.min_residual = -0.2
+        self.max_residual = 0.2
+
+
 
     def _reset(self):
         self.loss = []
@@ -223,22 +231,19 @@ class History:
         self.loss.append(loss)
         self.baseline.append(baseline)
 
-        
-
         if dist.get_rank() == 0:
-            loss = max(loss, baseline - 0.2)
-            loss = min(loss, baseline + 0.2)
-            color_loss = (loss - baseline + 0.2) / 0.4
-            color_loss = max(min(color_loss, 1.0), 0.0)
+            color_residual = (loss - baseline - self.min_residual) / (self.max_residual - self.min_residual)
+            color_residual = max(min(color_residual, 1.0), 0.0)
 
-            self.residual = self.residual * 0.99 + (loss - baseline) * 0.01
-            color_residual = (max(min(self.residual, 0.1), -0.1) + 0.1) / 0.2
+            self.residual_ema = self.residual_ema * 0.99 + (loss - baseline) * 0.01
+            color_residual_ema = (self.residual_ema - self.min_residual_ema) / (self.max_residual_ema - self.min_residual_ema)
+            color_residual_ema = max(min(color_residual_ema, 1.0), 0.0)
 
             info = self.template.format(
                 step=self.step,
                 baseline=baseline,
-                loss=gradient_color(f"{loss:.3f}", color_loss),
-                residual=gradient_color(f"{self.residual:.3f}", color_residual))
+                loss=gradient_color(f"{loss:.3f}", color_residual),
+                residual=gradient_color(f"{self.residual_ema:.3f}", color_residual_ema))
 
             print(info, flush=True)
 
@@ -271,8 +276,14 @@ class History:
             plt.plot(average_filter(self.baseline, 64))
             plt.legend(['loss', 'baseline'])
 
+            plt.savefig(f"history-{self.step}.jpg")
 
-            plt.savefig(self.path.format(step=self.step))
+            with open(f'history-{self.step}.json', 'w') as f:
+                import json
+                log_data = dict(
+                    loss=self.loss,
+                    baseline=self.baseline)
+                f.write(json.dumps(log_data))
 
         dist.barrier()
 
