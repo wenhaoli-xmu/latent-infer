@@ -6,28 +6,28 @@ from .utils import check_and_apply_qk_rope
 from flash_attn import flash_attn_func
 
 
-def model_forward(self, input_ids, input_embeds, mix_states, kv_cache):
+def model_forward(self, input_ids, input_embeds, prev_states, kv_cache, no_latent=False):
 
     hidden_states, kv_cache = self.model(input_ids, input_embeds, kv_cache)
-    latent_states = self.latent_head(hidden_states[..., -1:, :])
+    
 
-    last_hidden = hidden_states[..., -1:, :]
-
-    # mix hidden states with latent states for inference
-    if mix_states is not None:
-        mixed_states = self.mixer(mix_states, last_hidden)
-        logits = self.lm_head(mixed_states)
+    if no_latent:
+        # for loss computation of baseline
+        logits = self.lm_head(hidden_states)
+        hidden_states = None
+        latent_states = None
     else:
-        mixed_states = last_hidden
-        # we do not use last hidden states to predict logits becuase full logits are used in loss computation of baseline
-        logits = self.lm_head(hidden_states) 
+        # for next residual prediction
+        hidden_states = hidden_states[..., -1:, :]
+        hidden_states = self.mixer(prev_states, hidden_states)
+        latent_states = self.latent_head(hidden_states)
+        logits = self.lm_head(hidden_states)
 
-    # return
     return dict(
         logits=logits,
-        mixed_states=mixed_states,
+        hidden_states=hidden_states,
         latent_states=latent_states,
-        kv_cache=kv_cache,)
+        kv_cache=kv_cache)
 
 
 
@@ -154,32 +154,8 @@ class StatesMixer(torch.nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
 
-        self.lin1 = torch.nn.Linear(2 * hidden_size, 2 * hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
-        self.act1 = torch.nn.ReLU()
-        
-        self.lin2 = torch.nn.Linear(2 * hidden_size, 2 * hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
-        self.act2 = torch.nn.ReLU()
-
-        self.lin3 = torch.nn.Linear(2 * hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
-
-        torch.nn.init.zeros_(self.lin1.weight.data)
-        torch.nn.init.zeros_(self.lin2.weight.data)
-        torch.nn.init.zeros_(self.lin3.weight.data)
-        torch.nn.init.eye_(self.lin3.weight.data[:, :hidden_size])
-
-
-    def forward(self, x, y):
-        """
-        x: normal logits
-        y: latent logits
-        """
-        z = torch.cat([x, y], dim=-1)
-        
-        z = z + self.act1(self.lin1(z))
-        z = z + self.act2(self.lin2(z))
-        z = self.lin3(z)
-
-        return z
+    def forward(self, prev_states, hidden_states):
+        return prev_states + hidden_states if prev_states is not None else hidden_states
 
 
 class ModelForTraining(Modifier):
@@ -205,6 +181,5 @@ class ModelForTraining(Modifier):
 
     def ft_params(self):
         params = list(self.model.latent_head.parameters())
-        params += list(self.model.mixer.parameters())
 
         return params

@@ -200,7 +200,7 @@ if __name__ == '__main__':
             inputs = dict(
                 input_ids=input_ids[:,:skip],
                 input_embeds=None,
-                mix_states=None,
+                prev_states=None,
                 kv_cache=None)
             outputs = model(**inputs)
 
@@ -213,10 +213,11 @@ if __name__ == '__main__':
             inputs = dict(
                 input_ids=input_ids[:,i:i+1],
                 input_embeds=None, 
-                mix_states=None,
+                prev_states=None,
                 kv_cache=outputs['kv_cache'])
             outputs = model(**inputs)
 
+            # backup kv cache
             kv_cache_bkp = copy_kv_cache(outputs['kv_cache'])
 
             # latent infer
@@ -224,7 +225,7 @@ if __name__ == '__main__':
                 inputs = dict(
                     input_ids=None,
                     input_embeds=outputs['latent_states'],
-                    mix_states=outputs['mixed_states'],
+                    prev_states=outputs['hidden_states'],
                     kv_cache=outputs['kv_cache'])
                 outputs = model(**inputs)
 
@@ -234,8 +235,10 @@ if __name__ == '__main__':
                 loss_value = torch.nn.functional.cross_entropy(logits, label)
                 loss.update_inside(loss_value)
 
+            # recover kv cache
             outputs['kv_cache'] = kv_cache_bkp
 
+            # accumulate lm loss to compare with baseline
             with torch.no_grad():
                 logits = outputs['logits'].flatten(0,1)
                 label = labels[:, i:i+1].ravel()
@@ -259,8 +262,9 @@ if __name__ == '__main__':
             inputs = dict(
                 input_ids=input_ids,
                 input_embeds=None,
-                mix_states=None,
-                kv_cache=None)
+                prev_states=None,
+                kv_cache=None,
+                no_latent=True)
             outputs = model(**inputs)
 
             labels[:, :skip] = -100
