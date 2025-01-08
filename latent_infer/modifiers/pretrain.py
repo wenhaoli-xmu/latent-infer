@@ -19,8 +19,11 @@ def model_forward(self, input_ids, input_embeds, prev_states, kv_cache, no_laten
     else:
         # for next residual prediction
         hidden_states = hidden_states[..., -1:, :]
-        hidden_states = self.mixer(prev_states, hidden_states)
+
         latent_states = self.latent_head(hidden_states)
+        residue_states = self.residue_head(hidden_states)
+
+        hidden_states = self.mixer(prev_states, residue_states, hidden_states)
         logits = self.lm_head(hidden_states)
 
     return dict(
@@ -120,42 +123,38 @@ def self_attn_forward(self, hidden_states, kv_cache):
     return attn_output, kv_cache
 
 
+class ResidueHead(torch.nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.lin1 = torch.nn.Linear(hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        torch.nn.init.zeros_(self.lin1.weight.data)
+    
+    def forward(self, x):
+        return self.lin1(x)
+
+
 class LatentHead(torch.nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
-
-        self.lin1 = torch.nn.Linear(hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.lin1 = torch.nn.Linear(hidden_size, 4 * hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
         self.act1 = torch.nn.ReLU()
-
-        self.lin2 = torch.nn.Linear(hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.lin2 = torch.nn.Linear(4 * hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
         self.act2 = torch.nn.ReLU()
-
-        self.lin3 = torch.nn.Linear(hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
-        self.act3 = torch.nn.ReLU()
-
-        self.lin4 = torch.nn.Linear(hidden_size, hidden_size, bias=False, device='cuda', dtype=torch.bfloat16)
-        self.act4 = torch.nn.ReLU()
-
         torch.nn.init.xavier_uniform_(self.lin1.weight.data)
         torch.nn.init.xavier_uniform_(self.lin2.weight.data)
-        torch.nn.init.xavier_uniform_(self.lin3.weight.data)
-        torch.nn.init.xavier_uniform_(self.lin4.weight.data)
     
 
     def forward(self, x):
-        x = x + self.act1(self.lin1(x))
-        x = x + self.act2(self.lin2(x))
-        x = x + self.act3(self.lin3(x))
-        x = x + self.act4(self.lin4(x))
-        return x
+        y = self.act1(self.lin1(x))
+        return x + self.act2(self.lin2(y))
     
 
 class StatesMixer(torch.nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
 
-    def forward(self, prev_states, hidden_states):
-        return prev_states + hidden_states if prev_states is not None else hidden_states
+    def forward(self, prev_states, residue_states, hidden_states):
+        return prev_states + residue_states if prev_states is not None else hidden_states
 
 
 class ModelForTraining(Modifier):
@@ -170,6 +169,7 @@ class ModelForTraining(Modifier):
         model.forward = types.MethodType(model_forward, model)
         model.model.forward = types.MethodType(model_model_forward, model.model)
         model.latent_head = LatentHead(model.lm_head.in_features)
+        model.residue_head = ResidueHead(model.lm_head.in_features)
         model.mixer = StatesMixer(model.lm_head.in_features)
 
         for layer in model.model.layers:
@@ -181,5 +181,6 @@ class ModelForTraining(Modifier):
 
     def ft_params(self):
         params = list(self.model.latent_head.parameters())
+        params += list(self.model.residue_head.parameters())
 
         return params
