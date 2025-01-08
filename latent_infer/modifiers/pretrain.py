@@ -4,7 +4,6 @@ from transformers.models.qwen2.modeling_qwen2 import repeat_kv
 from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope
 from flash_attn import flash_attn_func
-from copy import deepcopy
 
 
 def model_forward(self, input_ids, input_embeds, mix_states, kv_cache):
@@ -12,17 +11,21 @@ def model_forward(self, input_ids, input_embeds, mix_states, kv_cache):
     hidden_states, kv_cache = self.model(input_ids, input_embeds, kv_cache)
     latent_states = self.latent_head(hidden_states[..., -1:, :])
 
+    last_hidden = hidden_states[..., -1:, :]
+
     # mix hidden states with latent states for inference
     if mix_states is not None:
-        mixed_states = self.mixer(mix_states, latent_states)
+        mixed_states = self.mixer(mix_states, last_hidden)
         logits = self.lm_head(mixed_states)
     else:
-        logits = self.lm_head(hidden_states)
+        mixed_states = last_hidden
+        # we do not use last hidden states to predict logits becuase full logits are used in loss computation of baseline
+        logits = self.lm_head(hidden_states) 
 
     # return
     return dict(
         logits=logits,
-        hidden_states=hidden_states[...,-1:,:],
+        mixed_states=mixed_states,
         latent_states=latent_states,
         kv_cache=kv_cache,)
 

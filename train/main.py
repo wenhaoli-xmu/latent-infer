@@ -217,7 +217,6 @@ if __name__ == '__main__':
                 kv_cache=outputs['kv_cache'])
             outputs = model(**inputs)
 
-            mix_states = outputs['hidden_states']
             kv_cache_bkp = copy_kv_cache(outputs['kv_cache'])
 
             # latent infer
@@ -225,7 +224,7 @@ if __name__ == '__main__':
                 inputs = dict(
                     input_ids=None,
                     input_embeds=outputs['latent_states'],
-                    mix_states=mix_states,
+                    mix_states=outputs['mixed_states'],
                     kv_cache=outputs['kv_cache'])
                 outputs = model(**inputs)
 
