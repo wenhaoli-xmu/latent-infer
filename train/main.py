@@ -200,7 +200,6 @@ if __name__ == '__main__':
             inputs = dict(
                 input_ids=input_ids[:,:skip],
                 input_embeds=None,
-                prev_states=None,
                 kv_cache=None)
             outputs = model(**inputs)
 
@@ -209,23 +208,27 @@ if __name__ == '__main__':
 
         for i in range(skip, input_ids.shape[-1]):
 
+            kv_cache_bkp1 = copy_kv_cache(outputs['kv_cache'])
+
             # ordinal infer
             inputs = dict(
                 input_ids=input_ids[:,i:i+1],
                 input_embeds=None, 
-                prev_states=None,
                 kv_cache=outputs['kv_cache'])
             outputs = model(**inputs)
 
             # backup kv cache
-            kv_cache_bkp = copy_kv_cache(outputs['kv_cache'])
+            kv_cache_bkp2 = copy_kv_cache(outputs['kv_cache'])
 
             # latent infer
             for _ in range(args.num_cot_tokens):
+
+                # recover kv cache backup
+                outputs['kv_cache'] = kv_cache_bkp1
+
                 inputs = dict(
                     input_ids=None,
-                    input_embeds=outputs['latent_states'],
-                    prev_states=outputs['hidden_states'],
+                    input_embeds=outputs['hidden_states'],
                     kv_cache=outputs['kv_cache'])
                 outputs = model(**inputs)
 
@@ -235,8 +238,8 @@ if __name__ == '__main__':
                 loss_value = torch.nn.functional.cross_entropy(logits, label)
                 loss.update_inside(loss_value)
 
-            # recover kv cache
-            outputs['kv_cache'] = kv_cache_bkp
+            # recover kv cache backup
+            outputs['kv_cache'] = kv_cache_bkp2
 
             # accumulate lm loss to compare with baseline
             with torch.no_grad():
@@ -262,7 +265,6 @@ if __name__ == '__main__':
             inputs = dict(
                 input_ids=input_ids,
                 input_embeds=None,
-                prev_states=None,
                 kv_cache=None,
                 no_latent=True)
             outputs = model(**inputs)
